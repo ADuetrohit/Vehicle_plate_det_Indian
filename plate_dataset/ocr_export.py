@@ -71,7 +71,9 @@ def merge_ocr_labels(
 ) -> int:
     """Preserve imported labels and append deterministic, non-duplicated synthetic rows."""
     existing_fields, existing_rows = _read_rows(Path(existing_csv))
-    synthetic = [{key: str(value) for key, value in row.items()} for row in synthetic_rows]
+    synthetic = _unique_synthetic_rows(
+        [{key: str(value) for key, value in row.items()} for row in synthetic_rows]
+    )
     fieldnames = _fieldnames(existing_fields, synthetic)
     seen = {_stable_key(row) for row in existing_rows}
     new_rows: list[dict[str, str]] = []
@@ -97,6 +99,17 @@ def merge_ocr_labels(
             temporary.unlink()
     return len(existing_rows) + len(new_rows)
 
+
+def _unique_synthetic_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    unique: dict[tuple[str, str], dict[str, str]] = {}
+    for row in rows:
+        key = _stable_key(row)
+        previous = unique.get(key)
+        if previous is None:
+            unique[key] = row
+        elif previous != row:
+            raise ValueError(f"conflicting synthetic OCR rows for {key[0]}:{key[1]}")
+    return list(unique.values())
 
 def _rgb_image(image: np.ndarray | Image.Image) -> Image.Image:
     if isinstance(image, Image.Image):

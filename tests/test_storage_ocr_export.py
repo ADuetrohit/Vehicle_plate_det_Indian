@@ -122,6 +122,17 @@ def test_storage_estimate_scales_source_pixels_to_configured_scene_edge(
 
     assert larger.projected_bytes > smaller.projected_bytes
 
+def test_storage_estimate_reserves_crop_for_every_target_scene(
+    sample_jpegs: list[Path], config: BuildConfig
+) -> None:
+    """Catches preflight shrinking OCR capacity from an assumed negative-rate midpoint."""
+    all_positive = estimate_storage(config, sample_jpegs)
+    mostly_negative = estimate_storage(
+        replace(config, negative_share=(0.50, 0.50)), sample_jpegs
+    )
+
+    assert mostly_negative.projected_bytes == all_positive.projected_bytes
+
 
 def test_exported_crop_is_256_by_128_and_checksum_valid(
     scene: np.ndarray, tmp_path: Path
@@ -183,6 +194,15 @@ def test_merge_sorts_new_rows_by_split_and_output_id(
         rows = list(csv.DictReader(handle))
     assert [row["image_name"] for row in rows[-2:]] == ["syn-a.jpg", "syn-z.jpg"]
 
+
+def test_merge_rejects_conflicting_synthetic_rows_with_same_stable_key(
+    existing_labels: Path, synthetic_row: dict[str, str], tmp_path: Path
+) -> None:
+    """Catches a resumed build silently choosing one of two conflicting OCR labels."""
+    conflict = dict(synthetic_row, plate_text="KA01ZZ9999")
+
+    with pytest.raises(ValueError, match="conflicting synthetic OCR rows.*synthetic:syn-b.jpg"):
+        merge_ocr_labels(existing_labels, [synthetic_row, conflict], tmp_path / "labels.csv")
 
 def test_manifest_writes_ocr_linkage_columns(tmp_path: Path) -> None:
     """Catches crop paths or checksums being silently discarded from generation metadata."""

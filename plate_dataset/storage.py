@@ -52,13 +52,11 @@ def estimate_storage(
     scene_bytes = math.ceil(
         bytes_per_pixel * average_scaled_pixels * config.target_images
     )
-    positive_share = 1.0 - sum(config.negative_share) / 2.0
     crop_bytes = math.ceil(
         bytes_per_pixel
         * config.ocr_canvas[0]
         * config.ocr_canvas[1]
         * config.target_images
-        * positive_share
     )
     raw_bytes = sum(size for size, _, _ in measurements)
     base_bytes = raw_bytes + scene_bytes + crop_bytes

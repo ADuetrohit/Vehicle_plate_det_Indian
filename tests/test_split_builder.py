@@ -10,6 +10,7 @@ import pytest
 
 from plate_dataset.builder import InsufficientSourceData, build_dataset
 from plate_dataset.config import BuildConfig
+from plate_dataset.manifests import sha256_file
 from plate_dataset.records import Box, ImageRecord
 from plate_dataset.split import assign_splits
 
@@ -153,3 +154,64 @@ def test_builder_rerun_reuses_checksum_valid_outputs(tmp_path: Path) -> None:
     assert first.generated_count == second.generated_count == 10
     assert second.reused_count == 10
     assert len(list((output / "detection" / "images").glob("*/*.jpg"))) == 10
+def _manifest_rows(path: Path) -> list[dict[str, str]]:
+    with path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _synthetic_only_config(workspace: Path) -> BuildConfig:
+    return replace(
+        _config(workspace, target=20),
+        synthetic_only=True,
+        negative_share=(0.10, 0.10),
+        max_scene_edge=160,
+        ocr_canvas=(256, 128),
+        min_free_gb=0,
+    )
+
+
+def test_synthetic_only_builder_writes_only_synthetic_outputs_and_crops(tmp_path: Path) -> None:
+    """Catches synthetic-only builds copying source scenes or omitting positive OCR crops."""
+    config = _synthetic_only_config(tmp_path / "dataset")
+
+    result = build_dataset(config, _write_real_records(tmp_path, 8), config.workspace)
+
+    rows = _manifest_rows(result.manifest_path)
+    assert len(rows) == 20
+    assert {row["origin"] for row in rows} == {"synthetic"}
+    assert sum(row["negative"] == "true" for row in rows) == 2
+    assert sum(bool(row["ocr_path"]) for row in rows) == 18
+    assert all(max(Image.open(config.workspace / row["image_path"]).size) <= 160 for row in rows)
+
+
+def test_synthetic_only_resume_checks_image_label_and_crop_checksums(tmp_path: Path) -> None:
+    """Catches reuse accepting a stale OCR crop alongside an otherwise valid pair."""
+    config = _synthetic_only_config(tmp_path / "dataset")
+    records = _write_real_records(tmp_path, 8)
+
+    first = build_dataset(config, records, config.workspace)
+    second = build_dataset(config, records, config.workspace)
+    assert second.reused_count == 20
+
+    positive = next(row for row in _manifest_rows(first.manifest_path) if row["ocr_path"])
+    crop_path = config.workspace / positive["ocr_path"]
+    crop_path.write_bytes(b"stale crop")
+
+    resumed = build_dataset(config, records, config.workspace)
+    refreshed = next(row for row in _manifest_rows(resumed.manifest_path) if row["output_id"] == positive["output_id"])
+    assert resumed.reused_count == 19
+    assert sha256_file(crop_path) == refreshed["ocr_sha256"]
+
+
+def test_rejected_output_is_replaced_without_changing_total(tmp_path: Path) -> None:
+    """Catches rejected synthetic IDs remaining in a resumed manifest or shrinking its quota."""
+    config = _synthetic_only_config(tmp_path / "dataset")
+    records = _write_real_records(tmp_path, 8)
+
+    first = build_dataset(config, records, config.workspace)
+    rejected = _manifest_rows(first.manifest_path)[0]["output_id"]
+    second = build_dataset(config, records, config.workspace, rejected_ids={rejected})
+    second_ids = {row["output_id"] for row in _manifest_rows(second.manifest_path)}
+
+    assert rejected not in second_ids
+    assert len(second_ids) == 20

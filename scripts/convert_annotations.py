@@ -6,13 +6,15 @@ import os
 from pathlib import Path
 import sys
 
+import yaml
+
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from plate_dataset.archives import safe_extract_zip
 from plate_dataset.config import load_config
 from plate_dataset.ingest import ingest_source
-from plate_dataset.sources import source_registry
+from plate_dataset.sources import SourceSpec, source_registry
 
 
 def parser() -> argparse.ArgumentParser:
@@ -46,14 +48,36 @@ def _record_json(record, workspace: Path) -> dict[str, object]:
     }
 
 
+def _license_is_allowed(spec: SourceSpec, license_dir: Path) -> bool:
+    if spec.license_status == "allowed":
+        return True
+    if spec.license_status != "verify":
+        return False
+    decision_path = license_dir / f"{spec.slug.replace('/', '__')}.yaml"
+    if not decision_path.is_file():
+        return False
+    try:
+        decision = yaml.safe_load(decision_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return False
+    return isinstance(decision, dict) and decision.get("decision") == "allowed"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     config = load_config(args.config)
     raw = config.workspace / "raw"
-    specs = {spec.slug.replace("/", "__"): spec for spec in source_registry()}
-    archives = sorted(raw.glob("*/*.zip")) if raw.exists() else []
+    license_dir = config.workspace / "metadata" / "licenses"
+    specs = {
+        spec.slug.replace("/", "__"): spec
+        for spec in source_registry()
+        if _license_is_allowed(spec, license_dir)
+    }
+    discovered = sorted(raw.glob("*/*.zip")) if raw.exists() else []
+    archives = [archive for archive in discovered if archive.parent.name in specs]
     if args.dry_run:
         print(f"archives={len(archives)}")
+        print(f"excluded_archives={len(discovered) - len(archives)}")
         print(
             "normalized_manifest="
             f"{config.workspace / 'metadata' / 'normalized_records.jsonl'}"
@@ -85,13 +109,17 @@ def main(argv: list[str] | None = None) -> int:
     output = config.workspace / "metadata" / "normalized_records.jsonl"
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        for record in sorted(records, key=lambda item: item.record_id):
-            handle.write(
-                json.dumps(_record_json(record, config.workspace), sort_keys=True)
-                + "\n"
-            )
-    os.replace(temporary, output)
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            for record in sorted(records, key=lambda item: item.record_id):
+                handle.write(
+                    json.dumps(_record_json(record, config.workspace), sort_keys=True)
+                    + "\n"
+                )
+        os.replace(temporary, output)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
     print(f"normalized_records={len(records)}")
     return 0
 

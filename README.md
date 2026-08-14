@@ -1,21 +1,36 @@
-# Maharashtra-focused Indian number-plate dataset
+# 50,000-image Indian number-plate synthetic dataset
 
-This project builds a reproducible one-class YOLO detection dataset (`number_plate`, class `0`) and a paired OCR crop collection. It is designed for Google Colab training and efficient inference on a Raspberry Pi 3B+ with Camera Module 3. The default build contains 12,000 full-scene images and can be expanded to 15,000.
+This project builds a reproducible one-class YOLO detection dataset (`number_plate`, class `0`) and a paired OCR crop collection. It creates the dataset only; detector training, model export, and real-camera benchmarking remain separate tasks.
 
-## Dataset policy
+## Fixed output profile
 
-- Seed: `20260814`; split: 80% train, 10% validation, 10% test.
-- Validation and test are at least 80% real images, with every source family kept in one split.
-- Synthetic positive plates are 60–70% Maharashtra (`MH`). Generated registrations are fictitious and checked against known real text.
-- Hard negatives are 5–10%. Single/double-row plates, both viewpoints, broad vehicle groups, lighting/weather degradations, and private/commercial/EV/temporary styles are represented.
-- The 2,122 reviewed crops from `../archive.zip` are preserved only as OCR samples, never as full-scene detector images.
-- Only license-approved sources enter the build. Registry entries marked `verify` remain excluded unless their local decision file under `metadata/licenses/` contains `decision: allowed`.
+- Seed: `20260814`.
+- Detector pairs: exactly 50,000 images and 50,000 matching labels.
+- Split: 40,000 train, 5,000 validation, and 5,000 test pairs.
+- Positives: 46,250 scenes and at least 46,250 linked synthetic OCR crops.
+- Hard negatives: 3,750 empty-label scenes: 3,000 train, 375 validation, and 375 test.
+- Maharashtra registrations: exactly 30,063 (65% after deterministic rounding) across positive scenes; this remains within the approved 60–70% range.
+- Double-row plates: exactly 9,250 (20%) across positive scenes; this remains within the approved 15–30% range.
+- Full scenes: longest edge at most 960 pixels, JPEG quality 88.
+- OCR crops: aspect-preserving 256×128 padded JPEGs.
+- Existing OCR corpus: preserve the separately identified 2,122 reviewed crops from `../archive.zip`; they do not count toward the synthetic minimum.
 
-Kaggle credentials stay in `D:\obj_det_dataset\kaggle.json` (or another directory selected with `KAGGLE_CONFIG_DIR`). Credential values are never copied into this project, manifests, logs, or reports.
+Every visible final plate is newly rendered and fictitious. Real source scenes supply geometry and background context, but unmodified source images do not enter the detector outputs.
+
+## Source and credential policy
+
+Two registry sources are allowed by default and recorded as CC0-1.0:
+
+1. `kedarsai/indian-license-plates-with-labels`
+2. `deepakat002/indian-vehicle-number-plate-yolo-annotation`
+
+Sources marked `verify` or `blocked` are excluded. A `verify` source can enter normalization only after a local `metadata/licenses/<source>.yaml` file records `decision: allowed`; its license must be reviewed independently first. Conversion ignores archives without an allowed decision and atomically replaces `metadata/normalized_records.jsonl` only after every selected archive has normalized successfully.
+
+Keep Kaggle credentials outside this repository. The commands below use `D:\obj_det_dataset\kaggle.json` through `KAGGLE_CONFIG_DIR`; credential contents are never copied into logs, manifests, or reports.
 
 ## Setup and staged build
 
-Run these commands from this project directory:
+Run from this project directory in PowerShell:
 
     python -m venv .venv
     .\.venv\Scripts\python -m pip install -e ".[dev]"
@@ -23,36 +38,55 @@ Run these commands from this project directory:
     .\.venv\Scripts\python scripts/download_sources.py --config config/default.yaml --dry-run
     .\.venv\Scripts\python scripts/download_sources.py --config config/default.yaml
     .\.venv\Scripts\python scripts/convert_annotations.py --config config/default.yaml
-    .\.venv\Scripts\python scripts/generate_synthetic.py --config config/default.yaml --resume
+    .\.venv\Scripts\python scripts/generate_synthetic.py --config config/default.yaml --dry-run --workers 0
+    .\.venv\Scripts\python scripts/generate_synthetic.py --config config/default.yaml --resume --workers 0
     .\.venv\Scripts\python scripts/validate_dataset.py --config config/default.yaml
 
-Generation writes temporary sibling files and atomically renames them. A rerun reuses an image-label pair only when both SHA-256 values match its manifest. `--no-resume` refuses a workspace with an existing manifest. Visual-QA rejects may be listed one output ID per line and supplied with `--reject-file`.
+The generation dry-run reads normalized source images, prints the exact split quotas, projected byte use, required 5 GB reserve, and current free bytes, and creates no detector files. Storage depends on measured source JPEG density. The design target is a final footprint below 25 GB; generation refuses to start unless the projected build can still leave at least 5 GB free. Do not start a second generator against the same workspace.
 
-## Layout and label schema
+`--workers 0` selects a bounded automatic worker count; use `--workers N` to set it explicitly. Generation prints progress after each 500 completed outputs and checkpoints the manifest during the build.
+
+## Resume and visual-QA replacement
+
+Generation writes each image, detector label, and OCR crop through a temporary sibling followed by atomic rename. `--resume` is the default: a prior output is reused only when every required file exists and its SHA-256 matches the manifest. `--no-resume` refuses to continue when a generation manifest already exists, protecting against accidental overwrite.
+
+To replace images rejected during visual review, put one generation `output_id` per line in a text file and rerun:
+
+    .\.venv\Scripts\python scripts/generate_synthetic.py --config config/default.yaml --resume --workers 0 --reject-file rejected_ids.txt
+
+Rejected IDs are omitted and replaced by later deterministic variants without deleting unrelated files. After generation, `ocr/labels.csv` is rebuilt from preserved existing OCR labels plus the current synthetic manifest, so removed synthetic IDs do not remain in the label table.
+
+## Output layout
 
     detection/images/{train,val,test}/*.jpg
     detection/labels/{train,val,test}/*.txt
     detection/data.yaml
-    ocr/images/{train,val,test}/*
+    ocr/images/{train,val,test}/*.jpg
     ocr/labels.csv
-    metadata/{source_manifest.csv,generation_manifest.csv,dataset_statistics.json}
-    reports/{validation_report.json,contact_sheets/}
-    notebooks/train_plate_detector_colab.ipynb
+    metadata/licenses/*
+    metadata/source_manifest.csv
+    metadata/normalized_records.jsonl
+    metadata/generation_manifest.csv
+    metadata/dataset_statistics.json
+    reports/validation_report.json
+    reports/contact_sheets/*.jpg
 
 Each non-empty detector label contains `0 x_center y_center width height`, normalized to `[0,1]`. Intentional hard negatives have an empty matching `.txt`. The portable Ultralytics configuration is [detection/data.yaml](detection/data.yaml).
 
-## Colab training
+## Validation and the synthetic-holdout limitation
 
-Upload the dataset as a ZIP or place it in Google Drive, open `notebooks/train_plate_detector_colab.ipynb`, set the dataset path, and run every cell. The workflow trains the nano detector at 512 pixels, validates once on the untouched test split, and exports ONNX and NCNN artifacts. Use a configurable batch size; automatic sizing is the safe default.
+The validator requires exact image, label, split, positive, negative, and OCR-crop counts; readable files; class-`0` finite in-bounds YOLO boxes; minimum projected plate size; checksum agreement; source-family isolation; and the specified registration, layout, lighting, and adverse-condition distributions. It exits nonzero whenever the report contains an error.
 
-## Raspberry Pi 3B+ runtime flow
+Validation and test use source families disjoint from training, but their visible plates are still synthetic. They measure pipeline consistency and held-out source-scene performance, not real-world Camera Module 3 accuracy. A clean validation report must not be presented as a real-camera benchmark.
 
-Keep the existing vehicle tracker as the first stage. Run the plate detector periodically inside each tracked vehicle crop, rank plate crops by size, sharpness, and confidence, and send only the best crops to OCR. Aggregate OCR predictions over several frames and accept a registration only after temporal consensus and Indian-format checks. This reduces CPU load substantially compared with full-frame OCR on every frame.
+## Colab handoff
 
-Synthetic data helps coverage, but final accuracy requires threshold tuning and evaluation on real Camera Module 3 footage from the installed pole height and distance. Collect both front and rear views plus daylight, night, rain, glare, occlusion, and motion cases.
+After local validation succeeds, package or upload the generated `detection/` directory and its `data.yaml` to Google Drive. In Colab, copy or mount the data into the runtime, extract it if uploaded as an archive, and confirm that `data.yaml` resolves `images/train`, `images/val`, and `images/test` before starting training. Install the training framework in Colab rather than adding it to this dataset-builder environment. Keep the test split untouched until the final model choice is fixed.
 
-## Validation gates
+The 50,000-image detector package can be large, so Google Drive transfer is more reliable than browser upload. Preserve the directory structure and compare archive or file checksums after transfer when possible.
 
-The validator requires matching readable image-label pairs, class `0`, finite in-bounds YOLO boxes, a minimum projected plate size of 8×4 pixels at 512 training resolution, checksum agreement, exact 80/10/10 counts, source-family isolation, at least 80% real validation/test data, 60–70% MH known positives, and 5–10% negatives. Contact-sheet captions intentionally omit plate text.
+## Camera Module 3 evaluation caveat
 
-Generated bulk images, labels, raw downloads, OCR crops, and sensitive credentials are excluded from Git. Source code, configuration, notebooks, documentation, license decisions, and compact validation statistics remain versioned.
+Final deployment thresholds and OCR acceptance rules require footage from the actual Raspberry Pi 3B+ and Camera Module 3 installation. Evaluate at the installed pole height, angle, and distance with front and rear vehicles across daylight, night, rain, glare, occlusion, and motion. Keep the vehicle tracker as the first stage, run plate detection within tracked vehicle crops, rank candidate crops, and aggregate OCR over multiple frames. Synthetic holdout metrics cannot replace that evaluation.
+
+Generated bulk images, labels, raw downloads, OCR crops, and sensitive credentials are excluded from Git. Source code, configuration, documentation, license decisions, and compact validation statistics remain versioned.

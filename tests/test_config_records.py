@@ -25,14 +25,17 @@ def test_box_rejects_non_plate_class() -> None:
         Box(class_id=1, x_min=1, y_min=1, x_max=2, y_max=2)
 
 
-def test_default_config_exposes_approved_build_contract() -> None:
-    """Catches a build silently using unapproved counts or split ratios."""
+def test_default_config_is_approved_50000_synthetic_build() -> None:
+    """Catches the default profile drifting from the approved production build."""
     cfg = load_config(Path("config/default.yaml"))
 
-    assert cfg.target_images == 12_000
-    assert cfg.max_images == 15_000
-    assert cfg.mh_share == (0.60, 0.70)
-    assert cfg.split == (0.80, 0.10, 0.10)
+    assert cfg.target_images == cfg.max_images == 50_000
+    assert cfg.synthetic_only is True
+    assert cfg.negative_share == (0.075, 0.075)
+    assert cfg.max_scene_edge == 960
+    assert cfg.jpeg_quality == 88
+    assert cfg.ocr_canvas == (256, 128)
+    assert cfg.min_free_gb == 5.0
 
 
 def test_config_rejects_split_that_does_not_sum_to_one(tmp_path: Path) -> None:

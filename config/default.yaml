@@ -1,9 +1,15 @@
 workspace: ..
 seed: 20260814
-target_images: 12000
-max_images: 15000
+target_images: 50000
+max_images: 50000
 mh_share: [0.60, 0.70]
 split: [0.80, 0.10, 0.10]
-negative_share: [0.05, 0.10]
+negative_share: [0.075, 0.075]
 training_imgsz: 512
 min_box_at_training_size: [8, 4]
+synthetic_only: true
+max_scene_edge: 960
+jpeg_quality: 88
+ocr_canvas: [256, 128]
+min_free_gb: 5.0
+workers: 0

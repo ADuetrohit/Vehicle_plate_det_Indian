@@ -290,3 +290,37 @@ def test_synthetic_negative_records_apply_and_report_assigned_conditions(tmp_pat
     assert all(row["effect"] == expected_conditions[row["output_id"]] for row in negatives)
     assert all(not row["ocr_path"] and not row["ocr_sha256"] for row in negatives)
     assert all((config.workspace / row["label_path"]).read_text(encoding="utf-8") == "" for row in negatives)
+
+def test_synthetic_only_resume_rebuilds_checksum_valid_stale_spec_metadata(tmp_path: Path) -> None:
+    """Catches resume preserving prior quota metadata after the current spec changes."""
+    config = _synthetic_only_config(tmp_path / "dataset")
+    records = _write_real_records(tmp_path, 8)
+    specs = {spec.output_id: spec for spec in _synthetic_specs(config, records, frozenset())}
+    first = build_dataset(config, records, config.workspace)
+    rows = _manifest_rows(first.manifest_path)
+    stale_negative = next(row for row in rows if row["negative"] == "true")
+    stale_positive = next(
+        row for row in rows if row["negative"] == "false" and specs[row["output_id"]].force_mh
+    )
+    stale_negative["negative"] = "false"
+    stale_negative["effect"] = "plate_removed"
+    stale_positive["plate_style"] = "commercial"
+    stale_positive["plate_layout"] = "single"
+    stale_positive["state"] = "DL"
+    stale_positive["effect"] = "day"
+    write_manifest(rows, first.manifest_path)
+
+    resumed = build_dataset(config, records, config.workspace)
+    final_rows = {row["output_id"]: row for row in _manifest_rows(resumed.manifest_path)}
+    quotas = generation_quotas(config)
+
+    assert resumed.reused_count == 18
+    assert final_rows[stale_negative["output_id"]]["negative"] == "true"
+    assert final_rows[stale_negative["output_id"]]["effect"] == specs[stale_negative["output_id"]].condition
+    assert final_rows[stale_positive["output_id"]]["plate_style"] == specs[stale_positive["output_id"]].category
+    assert final_rows[stale_positive["output_id"]]["plate_layout"] == specs[stale_positive["output_id"]].layout
+    assert final_rows[stale_positive["output_id"]]["state"] == "MH"
+    for split, quota in quotas.items():
+        assert sum(
+            row["negative"] == "true" for row in final_rows.values() if row["split"] == split
+        ) == quota.negatives

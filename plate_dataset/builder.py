@@ -259,6 +259,33 @@ def _load_scaled_anchor(source: ImageRecord, max_scene_edge: int) -> tuple[np.nd
     return scene, max(candidates, key=lambda box: (box.x_max - box.x_min) * (box.y_max - box.y_min))
 
 
+def _matches_synthetic_spec(row: Mapping[str, str] | None, spec: GenerationSpec) -> bool:
+    if not row:
+        return False
+    if (
+        row.get("origin") != "synthetic"
+        or row.get("split") != spec.split
+        or row.get("source_family") != spec.source.source_family
+        or row.get("negative") != str(spec.negative).lower()
+        or row.get("effect") != spec.condition
+    ):
+        return False
+    if spec.negative:
+        return (
+            row.get("plate_style") == "removed"
+            and row.get("plate_layout") == "none"
+            and not row.get("state")
+            and not row.get("plate_text")
+            and not row.get("ocr_path")
+            and not row.get("ocr_sha256")
+        )
+    return (
+        row.get("plate_style") == spec.category
+        and row.get("plate_layout") == spec.layout
+        and (row.get("state") == "MH") == spec.force_mh
+    )
+
+
 def _render_synthetic_spec(
     config: BuildConfig,
     spec: GenerationSpec,
@@ -268,7 +295,9 @@ def _render_synthetic_spec(
     fonts: Sequence[Path],
 ) -> GenerationResult:
     old_row = previous.get(spec.output_id)
-    if _can_reuse(old_row, output, requires_ocr=not spec.negative):
+    if _matches_synthetic_spec(old_row, spec) and _can_reuse(
+        old_row, output, requires_ocr=not spec.negative
+    ):
         return GenerationResult(dict(old_row), True)
 
     scene, anchor = _load_scaled_anchor(spec.source, config.max_scene_edge)

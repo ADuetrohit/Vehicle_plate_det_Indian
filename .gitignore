@@ -7,6 +7,7 @@ raw/
 detection/images/
 detection/labels/
 ocr/images/
+ocr/labels.csv
 metadata/source_manifest.csv
 metadata/generation_manifest.csv
 reports/contact_sheets/

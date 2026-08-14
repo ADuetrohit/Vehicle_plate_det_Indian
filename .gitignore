@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.egg-info/
+raw/
+detection/images/
+detection/labels/
+ocr/images/
+metadata/source_manifest.csv
+metadata/generation_manifest.csv
+reports/contact_sheets/
+kaggle.json
+*.zip
+*.rar

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mh-plate-dataset"
+version = "0.1.0"
+description = "Reproducible Maharashtra-focused Indian number-plate dataset builder"
+requires-python = ">=3.10"
+dependencies = [
+    "Pillow>=10.4,<13",
+    "numpy>=1.26,<3",
+    "opencv-python-headless>=4.10,<5",
+    "PyYAML>=6,<7",
+    "ImageHash>=4.3,<5",
+    "kaggle>=1.6,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<10",
+    "nbformat>=5.10,<6",
+]
+train = [
+    "ultralytics>=8.3,<9",
+]
+
+[tool.setuptools.packages.find]
+include = ["plate_dataset*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"

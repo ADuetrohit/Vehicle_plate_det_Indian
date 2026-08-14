@@ -1,0 +1,9 @@
+workspace: ..
+seed: 20260814
+target_images: 12000
+max_images: 15000
+mh_share: [0.60, 0.70]
+split: [0.80, 0.10, 0.10]
+negative_share: [0.05, 0.10]
+training_imgsz: 512
+min_box_at_training_size: [8, 4]

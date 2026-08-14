@@ -37,6 +37,19 @@ def assign_splits(
     if len({record.record_id for record in records}) != len(records):
         raise ValueError("record IDs must be unique")
     targets = split_target_counts(config.target_images, config.split)
+    if not config.synthetic_only:
+        minimum_real = {
+            "val": int(math.ceil(targets["val"] * 0.80)),
+            "test": int(math.ceil(targets["test"] * 0.80)),
+        }
+        available_real = sum(record.is_real for record in records)
+        required_real = minimum_real["val"] + minimum_real["test"]
+        if available_real < required_real:
+            raise InsufficientSourceData(
+                f"real holdout requirement cannot be met: required_real={required_real} "
+                f"available_real={available_real}"
+            )
+
     grouped: dict[str, list[ImageRecord]] = defaultdict(list)
     for record in records:
         grouped[record.source_family].append(record)

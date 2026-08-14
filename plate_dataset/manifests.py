@@ -26,6 +26,8 @@ MANIFEST_FIELDS = (
     "plate_layout",
     "effect",
     "ocr_eligible",
+    "ocr_path",
+    "ocr_sha256",
 )
 
 

@@ -6,6 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
+from textwrap import wrap
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -54,13 +55,25 @@ def _caption(row: dict[str, str]) -> str:
     )
 
 
+def _caption_lines(row: dict[str, str], width: int = 36) -> tuple[str, ...]:
+    """Wrap each safe caption field without dropping category or condition."""
+    fields = (row.get("output_id", "?"), row.get("plate_style", "?"), row.get("effect", "?"))
+    return tuple(
+        line
+        for field in fields
+        for line in (wrap(field, width=width, break_on_hyphens=False) or ["?"])
+    )
+
+
 def _draw_sample(root: Path, row: dict[str, str], size: tuple[int, int]) -> Image.Image:
     image_path = root / row["image_path"]
     label_path = root / row["label_path"]
     with Image.open(image_path) as source:
         source = source.convert("RGB")
         original_width, original_height = source.size
-        max_width, max_height = size[0], size[1] - 28
+        caption_lines = _caption_lines(row)
+        caption_height = len(caption_lines) * 11 + 5
+        max_width, max_height = size[0], max(1, size[1] - caption_height)
         scale = min(max_width / original_width, max_height / original_height)
         resized = source.resize(
             (max(1, round(original_width * scale)), max(1, round(original_height * scale))),
@@ -77,8 +90,9 @@ def _draw_sample(root: Path, row: dict[str, str], size: tuple[int, int]) -> Imag
         x2 = offset_x + (x + width / 2) * resized.width
         y2 = offset_y + (y + height / 2) * resized.height
         draw.rectangle((x1, y1, x2, y2), outline="#00ff5a", width=2)
-    caption = _caption(row)
-    draw.text((5, size[1] - 22), caption[:52], fill="white", font=ImageFont.load_default())
+    caption_top = size[1] - caption_height
+    for index, caption_line in enumerate(caption_lines):
+        draw.text((5, caption_top + index * 11), caption_line, fill="white", font=ImageFont.load_default())
     return canvas
 
 

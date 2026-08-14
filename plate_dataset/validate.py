@@ -15,6 +15,9 @@ from .quotas import generation_quotas
 from .split import split_target_counts
 
 
+_SPLITS = ("train", "val", "test")
+
+
 @dataclass(frozen=True)
 class ValidationIssue:
     severity: Literal["error", "warning"]
@@ -196,6 +199,99 @@ def _validate_synthetic_quotas(
             )
 
 
+def _validate_synthetic_manifest_rows(
+    root: Path,
+    rows: list[dict[str, str]],
+    issues: list[ValidationIssue],
+) -> set[str]:
+    output_ids = Counter(row.get("output_id", "") for row in rows)
+    pair_keys = Counter(
+        (row.get("split", ""), row.get("output_id", "")) for row in rows
+    )
+    for output_id, count in output_ids.items():
+        if output_id and count > 1:
+            _issue(
+                issues,
+                "duplicate_manifest_output_id",
+                output_id,
+                f"output_id appears in {count} manifest rows",
+            )
+    for pair_key, count in pair_keys.items():
+        if pair_key[1] and count > 1:
+            _issue(
+                issues,
+                "duplicate_manifest_pair",
+                ":".join(pair_key),
+                f"manifest pair appears in {count} rows",
+            )
+
+    claimed_crops: dict[str, list[str]] = defaultdict(list)
+    valid_crops: set[str] = set()
+    for row in rows:
+        output_id = row.get("output_id", "")
+        split = row.get("split", "")
+        if split not in _SPLITS:
+            _issue(
+                issues,
+                "invalid_manifest_split",
+                output_id or "manifest",
+                f"split {split!r} is not one of {_SPLITS}",
+            )
+            continue
+        expected_image = f"detection/images/{split}/{output_id}.jpg"
+        expected_label = f"detection/labels/{split}/{output_id}.txt"
+        paths_match = (
+            row.get("image_path") == expected_image
+            and row.get("label_path") == expected_label
+        )
+        if not paths_match:
+            _issue(
+                issues,
+                "invalid_manifest_pair_path",
+                output_id or split,
+                "image_path and label_path must match the split and output_id",
+            )
+        pair_exists = (root / expected_image).is_file() and (root / expected_label).is_file()
+        if not pair_exists:
+            _issue(
+                issues,
+                "missing_manifest_pair",
+                output_id or split,
+                "manifest row does not reference an existing image-label pair",
+            )
+        if row.get("negative", "").lower() == "true":
+            continue
+        ocr_path = row.get("ocr_path", "")
+        if ocr_path:
+            claimed_crops[ocr_path].append(output_id)
+        expected_crop = f"ocr/images/{split}/{output_id}.jpg"
+        if ocr_path != expected_crop:
+            _issue(
+                issues,
+                "invalid_ocr_path",
+                output_id or split,
+                "positive OCR path must match its split and output_id",
+            )
+        crop = root / expected_crop
+        if not crop.is_file():
+            _issue(issues, "missing_ocr_crop", crop, "positive image has no linked OCR crop")
+            continue
+        if not row.get("ocr_sha256") or sha256_file(crop) != row.get("ocr_sha256"):
+            _issue(issues, "ocr_checksum_mismatch", crop, "ocr_sha256 does not match manifest")
+            continue
+        if paths_match and pair_exists and ocr_path == expected_crop:
+            valid_crops.add(expected_crop)
+    for crop_path, output_ids in claimed_crops.items():
+        if len(output_ids) > 1:
+            _issue(
+                issues,
+                "duplicate_ocr_crop",
+                crop_path,
+                f"OCR crop is linked by {sorted(output_ids)}",
+            )
+    return valid_crops
+
+
 def validate_dataset(root: Path, config: BuildConfig) -> ValidationReport:
     root = Path(root)
     issues: list[ValidationIssue] = []
@@ -213,12 +309,16 @@ def validate_dataset(root: Path, config: BuildConfig) -> ValidationReport:
 
     manifest_path = root / "metadata" / "generation_manifest.csv"
     rows = _read_manifest(manifest_path, issues)
+    valid_ocr_crops = (
+        _validate_synthetic_manifest_rows(root, rows, issues)
+        if config.synthetic_only
+        else set()
+    )
     row_by_key = {
         (row.get("split", ""), Path(row.get("image_path", "")).stem): row
         for row in rows
     }
     observed_negatives: Counter[str] = Counter()
-    valid_ocr_crops = 0
 
     for key in sorted(image_by_key.keys() & label_by_key.keys()):
         image_path = image_by_key[key]
@@ -246,16 +346,6 @@ def validate_dataset(root: Path, config: BuildConfig) -> ValidationReport:
             has_text = bool(row.get("plate_text", ""))
             if ocr_eligible and (negative or not has_text):
                 _issue(issues, "invalid_ocr_eligibility", image_path, "OCR eligibility requires a visible plate with known text")
-            if config.synthetic_only and not negative:
-                ocr_path = row.get("ocr_path", "")
-                ocr_checksum = row.get("ocr_sha256", "")
-                crop = root / ocr_path if ocr_path else None
-                if crop is None or not crop.is_file():
-                    _issue(issues, "missing_ocr_crop", image_path, "positive image has no linked OCR crop")
-                elif not ocr_checksum or sha256_file(crop) != ocr_checksum:
-                    _issue(issues, "ocr_checksum_mismatch", crop, "ocr_sha256 does not match manifest")
-                else:
-                    valid_ocr_crops += 1
 
     split_counts = Counter(path.parent.name for path in images)
     targets = split_target_counts(config.target_images, config.split)
@@ -287,12 +377,12 @@ def validate_dataset(root: Path, config: BuildConfig) -> ValidationReport:
 
     if config.synthetic_only:
         _validate_synthetic_quotas(rows, observed_negatives, config, manifest_path, issues)
-        if config.target_images == 50_000 and valid_ocr_crops < 46_250:
+        if config.target_images == 50_000 and len(valid_ocr_crops) < 46_250:
             _issue(
                 issues,
                 "ocr_crop_count_mismatch",
                 root / "ocr" / "images",
-                f"found {valid_ocr_crops} valid crops, expected at least 46250",
+                f"found {len(valid_ocr_crops)} valid crops, expected at least 46250",
             )
     else:
         for split in ("val", "test"):

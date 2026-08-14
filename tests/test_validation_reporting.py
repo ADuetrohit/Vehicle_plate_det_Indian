@@ -10,6 +10,7 @@ import pytest
 from plate_dataset.config import BuildConfig
 from plate_dataset.manifests import sha256_file
 from plate_dataset.reporting import _caption, make_contact_sheets, write_statistics
+from plate_dataset import reporting
 from plate_dataset.validate import validate_dataset
 
 
@@ -191,6 +192,78 @@ def test_validator_requires_linked_crop_checksum(synthetic_fixture: SyntheticFix
     assert any(issue.code == "ocr_checksum_mismatch" for issue in report.issues)
 
 
+def test_validator_rejects_noncanonical_duplicate_ocr_crop_links(
+    synthetic_fixture: SyntheticFixture,
+) -> None:
+    """Catches two positives sharing one otherwise checksum-valid OCR crop."""
+    rows = _manifest_rows(synthetic_fixture.root)
+    first, second = [row for row in rows if row["negative"] == "false"][:2]
+    second["ocr_path"] = first["ocr_path"]
+    second["ocr_sha256"] = first["ocr_sha256"]
+    _write_manifest_rows(synthetic_fixture.root, rows)
+
+    report = validate_dataset(synthetic_fixture.root, synthetic_fixture.config)
+
+    assert any(issue.code == "invalid_ocr_path" for issue in report.issues)
+    assert any(issue.code == "duplicate_ocr_crop" for issue in report.issues)
+
+
+def test_validator_rejects_manifest_row_with_unknown_split(
+    synthetic_fixture: SyntheticFixture,
+) -> None:
+    """Catches manifest rows silently omitted from the synthetic split quotas."""
+    rows = _manifest_rows(synthetic_fixture.root)
+    rows[0]["split"] = "unknown"
+    _write_manifest_rows(synthetic_fixture.root, rows)
+
+    report = validate_dataset(synthetic_fixture.root, synthetic_fixture.config)
+
+    assert any(issue.code == "invalid_manifest_split" for issue in report.issues)
+
+
+def test_validator_rejects_manifest_paths_outside_expected_pair(
+    synthetic_fixture: SyntheticFixture,
+) -> None:
+    """Catches a manifest row whose stem matches but its declared pair path does not."""
+    rows = _manifest_rows(synthetic_fixture.root)
+    _first_row(rows, negative="false")["image_path"] = "other/syn-01.jpg"
+    _write_manifest_rows(synthetic_fixture.root, rows)
+
+    report = validate_dataset(synthetic_fixture.root, synthetic_fixture.config)
+
+    assert any(issue.code == "invalid_manifest_pair_path" for issue in report.issues)
+
+
+def test_validator_checks_ocr_for_positive_manifest_orphan(
+    synthetic_fixture: SyntheticFixture,
+) -> None:
+    """Catches an orphaned positive row even when its missing crop has no file pair loop."""
+    rows = _manifest_rows(synthetic_fixture.root)
+    row = _first_row(rows, negative="false")
+    (synthetic_fixture.root / row["image_path"]).unlink()
+    (synthetic_fixture.root / row["label_path"]).unlink()
+    (synthetic_fixture.root / row["ocr_path"]).unlink()
+
+    report = validate_dataset(synthetic_fixture.root, synthetic_fixture.config)
+
+    assert any(issue.code == "missing_manifest_pair" for issue in report.issues)
+    assert any(issue.code == "missing_ocr_crop" for issue in report.issues)
+
+
+def test_validator_rejects_duplicate_manifest_output_ids(
+    synthetic_fixture: SyntheticFixture,
+) -> None:
+    """Catches duplicate manifest output IDs before they overwrite the pair lookup."""
+    rows = _manifest_rows(synthetic_fixture.root)
+    rows.append(rows[0].copy())
+    _write_manifest_rows(synthetic_fixture.root, rows)
+
+    report = validate_dataset(synthetic_fixture.root, synthetic_fixture.config)
+
+    assert any(issue.code == "duplicate_manifest_output_id" for issue in report.issues)
+    assert any(issue.code == "duplicate_manifest_pair" for issue in report.issues)
+
+
 def test_validator_requires_default_ocr_crop_floor(synthetic_fixture: SyntheticFixture) -> None:
     """Catches a nominal 50,000-image build with fewer than 46,250 valid OCR crops."""
     default_config = replace(
@@ -283,6 +356,23 @@ def test_contact_sheet_caption_uses_safe_sample_metadata() -> None:
 
     assert caption == "syn-42 | commercial | rain"
     assert "MH12AB9999" not in caption
+
+
+def test_contact_sheet_caption_lines_keep_condition_for_long_output_id() -> None:
+    """Catches the condition being clipped when a QA sample has a long output ID."""
+    output_id = "synthetic-sample-" + "x" * 80
+    lines = getattr(reporting, "_caption_lines", lambda _: ())(
+        {
+            "output_id": output_id,
+            "plate_style": "commercial",
+            "effect": "rain",
+            "plate_text": "MH12AB9999",
+        }
+    )
+
+    assert "".join(lines[:-2]) == output_id
+    assert lines[-2:] == ("commercial", "rain")
+    assert all("MH12AB9999" not in line for line in lines)
 
 
 def test_contact_sheets_group_by_split_style_layout_and_condition(

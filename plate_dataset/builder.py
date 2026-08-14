@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 import hashlib
 import math
 import os
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 import numpy as np
 from PIL import Image
@@ -18,7 +19,7 @@ from .manifests import load_manifest, sha256_file, write_manifest
 from .ocr_export import export_ocr_crop
 from .quotas import generation_quotas
 from .records import Box, ImageRecord
-from .registration import generate_identity
+from .registration import PlateIdentity, generate_identity
 from .render import PlateStyle, discover_font_paths, render_plate
 from .split import SplitName, assign_splits, split_target_counts
 
@@ -44,6 +45,7 @@ _CATEGORIES = (
     "temporary",
 )
 _EFFECTS = ("day", "night", "rain", "fog", "glare", "shadow", "motion", "compression")
+_CHECKPOINT_INTERVAL = 100
 
 
 def _stable_hex(*values: object) -> str:
@@ -168,6 +170,13 @@ class GenerationResult:
     reused: bool
 
 
+@dataclass(frozen=True)
+class GenerationJob:
+    spec: GenerationSpec
+    identity: PlateIdentity | None
+    rng_state: dict[str, object] | None
+
+
 def _synthetic_specs(
     config: BuildConfig,
     records: Sequence[ImageRecord],
@@ -289,6 +298,45 @@ def _matches_synthetic_spec(row: Mapping[str, str] | None, spec: GenerationSpec)
     )
 
 
+def _prepare_synthetic_jobs(
+    config: BuildConfig,
+    specs: Sequence[GenerationSpec],
+    records: Sequence[ImageRecord],
+    output: Path,
+    previous: Mapping[str, Mapping[str, str]],
+) -> list[GenerationJob]:
+    forbidden = {record.plate_text for record in records if record.plate_text}
+    jobs = []
+    for spec in specs:
+        if spec.negative:
+            jobs.append(GenerationJob(spec=spec, identity=None, rng_state=None))
+            continue
+        generator = _rng(
+            config.seed, spec.split, spec.source.source_family, spec.variant_index
+        )
+        identity = generate_identity(
+            generator,
+            mh_probability=1.0 if spec.force_mh else 0.0,
+            forbidden=forbidden,
+        )
+        jobs.append(
+            GenerationJob(
+                spec=spec,
+                identity=identity,
+                rng_state=generator.bit_generator.state,
+            )
+        )
+        old_row = previous.get(spec.output_id)
+        if _matches_synthetic_spec(old_row, spec) and _can_reuse(
+            old_row, output, requires_ocr=True
+        ):
+            text = str(old_row.get("plate_text", ""))
+            forbidden.update(part for part in text.split("|") if part)
+        else:
+            forbidden.add(identity.compact_text)
+    return jobs
+
+
 def _render_synthetic_spec(
     config: BuildConfig,
     spec: GenerationSpec,
@@ -296,6 +344,8 @@ def _render_synthetic_spec(
     previous: Mapping[str, Mapping[str, str]],
     forbidden: set[str],
     fonts: Sequence[Path],
+    prepared_identity: PlateIdentity | None = None,
+    prepared_rng_state: dict[str, object] | None = None,
 ) -> GenerationResult:
     old_row = previous.get(spec.output_id)
     if _matches_synthetic_spec(old_row, spec) and _can_reuse(
@@ -325,12 +375,18 @@ def _render_synthetic_spec(
             generator,
         ).image
     else:
-        identity = generate_identity(
-            generator,
-            mh_probability=1.0 if spec.force_mh else 0.0,
-            forbidden=forbidden,
-        )
-        forbidden.add(identity.compact_text)
+        if prepared_identity is None:
+            identity = generate_identity(
+                generator,
+                mh_probability=1.0 if spec.force_mh else 0.0,
+                forbidden=forbidden,
+            )
+            forbidden.add(identity.compact_text)
+        else:
+            if prepared_rng_state is None:
+                raise RuntimeError("prepared identity is missing its RNG state")
+            identity = prepared_identity
+            generator.bit_generator.state = prepared_rng_state
         rendered = render_plate(
             identity,
             PlateStyle(
@@ -386,27 +442,134 @@ def _render_synthetic_spec(
     return GenerationResult(_finish_row(row, image_path, label_path), False)
 
 
+_WORKER_CONTEXT: tuple[
+    BuildConfig,
+    Path,
+    Mapping[str, Mapping[str, str]],
+    Sequence[Path],
+] | None = None
+
+
+def _initialize_synthetic_worker(
+    config: BuildConfig,
+    output: Path,
+    previous: Mapping[str, Mapping[str, str]],
+    fonts: Sequence[Path],
+) -> None:
+    global _WORKER_CONTEXT
+    _WORKER_CONTEXT = (config, output, previous, fonts)
+
+
+def _render_synthetic_job_worker(job: GenerationJob) -> GenerationResult:
+    if _WORKER_CONTEXT is None:
+        raise RuntimeError("synthetic worker context was not initialized")
+    config, output, previous, fonts = _WORKER_CONTEXT
+    return _render_synthetic_spec(
+        config,
+        job.spec,
+        output,
+        previous,
+        set(),
+        fonts,
+        job.identity,
+        job.rng_state,
+    )
+
+
+def _resolved_worker_count(requested: int) -> int:
+    if requested:
+        return requested
+    return max(1, min((os.cpu_count() or 1) - 1, 8))
+
+
+def _render_failure(job: GenerationJob, error: Exception) -> RuntimeError:
+    return RuntimeError(
+        f"synthetic output {job.spec.output_id} failed with {type(error).__name__}"
+    )
+
+
 def _build_synthetic_only(
     config: BuildConfig,
     records: Sequence[ImageRecord],
     output: Path,
     rejected_ids: frozenset[str],
+    progress: Callable[[int, int], object] | None = None,
 ) -> BuildManifest:
     manifest_path = output / "metadata" / "generation_manifest.csv"
     previous = load_manifest(manifest_path)
     specs = _synthetic_specs(config, records, rejected_ids)
-    forbidden = {record.plate_text for record in records if record.plate_text}
+    jobs = _prepare_synthetic_jobs(config, specs, records, output, previous)
     fonts = discover_font_paths()
     rows: list[dict[str, object]] = []
     reused = 0
-    for spec in specs:
-        result = _render_synthetic_spec(config, spec, output, previous, forbidden, fonts)
+
+    def record_result(result: GenerationResult) -> None:
+        nonlocal reused
         if result.reused:
             reused += 1
-            text = str(result.row.get("plate_text", ""))
-            if text:
-                forbidden.update(part for part in text.split("|") if part)
         rows.append(result.row)
+        if len(rows) % _CHECKPOINT_INTERVAL == 0:
+            write_manifest(rows, manifest_path)
+        if progress is not None:
+            progress(len(rows), len(jobs))
+
+    workers = _resolved_worker_count(config.workers)
+    if workers == 1:
+        for job in jobs:
+            try:
+                result = _render_synthetic_spec(
+                    config,
+                    job.spec,
+                    output,
+                    previous,
+                    set(),
+                    fonts,
+                    job.identity,
+                    job.rng_state,
+                )
+            except Exception as error:
+                raise _render_failure(job, error) from error
+            record_result(result)
+    else:
+        executor = ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_initialize_synthetic_worker,
+            initargs=(config, output, previous, fonts),
+        )
+        pending: dict[Future[GenerationResult], GenerationJob] = {}
+        job_iterator = iter(jobs)
+        pending_limit = workers * 2
+
+        def fill_pending() -> None:
+            while len(pending) < pending_limit:
+                try:
+                    job = next(job_iterator)
+                except StopIteration:
+                    return
+                pending[executor.submit(_render_synthetic_job_worker, job)] = job
+
+        try:
+            fill_pending()
+            while pending:
+                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                ordered = sorted(
+                    completed, key=lambda future: pending[future].spec.output_id
+                )
+                for future in ordered:
+                    job = pending.pop(future)
+                    try:
+                        result = future.result()
+                    except Exception as error:
+                        raise _render_failure(job, error) from error
+                    record_result(result)
+                fill_pending()
+        except Exception:
+            for future in pending:
+                future.cancel()
+            raise
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
     if len(rows) != config.target_images:
         raise RuntimeError(f"builder emitted {len(rows)} records, expected {config.target_images}")
     write_manifest(rows, manifest_path)
@@ -436,7 +599,13 @@ def build_dataset(
         records = ordered[: config.target_images]
 
     if config.synthetic_only:
-        return _build_synthetic_only(config, records, output, frozenset(rejected_ids))
+        return _build_synthetic_only(
+            config,
+            records,
+            output,
+            frozenset(rejected_ids),
+            progress if callable(progress) else None,
+        )
 
     assignments = assign_splits(records, config)
     targets = split_target_counts(config.target_images, config.split)

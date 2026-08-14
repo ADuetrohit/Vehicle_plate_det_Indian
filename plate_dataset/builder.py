@@ -16,6 +16,7 @@ from .composite import CompositeResult, composite_plate, erase_plate
 from .config import BuildConfig
 from .manifests import load_manifest, sha256_file, write_manifest
 from .ocr_export import export_ocr_crop
+from .quotas import generation_quotas
 from .records import Box, ImageRecord
 from .registration import generate_identity
 from .render import PlateStyle, discover_font_paths, render_plate
@@ -87,7 +88,12 @@ def _relative(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
-def _can_reuse(row: Mapping[str, str] | None, output: Path) -> bool:
+def _can_reuse(
+    row: Mapping[str, str] | None,
+    output: Path,
+    *,
+    requires_ocr: bool = False,
+) -> bool:
     if not row:
         return False
     image = output / row.get("image_path", "")
@@ -100,7 +106,7 @@ def _can_reuse(row: Mapping[str, str] | None, output: Path) -> bool:
     )
     ocr_path = row.get("ocr_path", "")
     if not ocr_path:
-        return valid_pair
+        return valid_pair and not requires_ocr
     crop = output / ocr_path
     return valid_pair and crop.is_file() and sha256_file(crop) == row.get("ocr_sha256")
 
@@ -178,23 +184,24 @@ def _synthetic_specs(
         for sources in families.values():
             sources.sort(key=lambda source: source.record_id)
 
-    targets = split_target_counts(config.target_images, config.split)
-    negative_count = min(
-        config.target_images,
-        int(round(config.target_images * sum(config.negative_share) / 2.0)),
-    )
-    positive_count = config.target_images - negative_count
-    mh_count = int(round(positive_count * sum(config.mh_share) / 2.0))
+    quotas = generation_quotas(config)
     specs: list[GenerationSpec] = []
     global_index = 0
     for split in ("train", "val", "test"):
+        quota = quotas[split]
         family_names = sorted(grouped[split])
-        if targets[split] and not family_names:
+        if quota.total and not family_names:
             raise InsufficientSourceData(
                 f"split {split} has no source scene from which to create variants"
             )
         next_variant = {family: 0 for family in family_names}
-        for slot in range(targets[split]):
+        conditions = (
+            ["night"] * quota.low_light
+            + ["rain"] * quota.adverse
+            + ["day", "fog", "glare", "shadow", "motion", "compression"]
+            * ((quota.total - quota.low_light - quota.adverse + 5) // 6)
+        )
+        for slot in range(quota.total):
             family = family_names[slot % len(family_names)]
             variant_index = next_variant[family]
             output_id = f"syn-{_stable_hex(config.seed, split, family, variant_index)[:20]}"
@@ -203,8 +210,8 @@ def _synthetic_specs(
                 output_id = f"syn-{_stable_hex(config.seed, split, family, variant_index)[:20]}"
             next_variant[family] = variant_index + 1
             source = grouped[split][family][variant_index % len(grouped[split][family])]
-            negative = global_index < negative_count
-            positive_index = global_index - negative_count
+            negative = slot < quota.negatives
+            positive_index = slot - quota.negatives
             specs.append(
                 GenerationSpec(
                     output_id=output_id,
@@ -213,10 +220,14 @@ def _synthetic_specs(
                     global_index=global_index,
                     variant_index=variant_index,
                     negative=negative,
-                    force_mh=not negative and positive_index < mh_count,
-                    layout="double" if global_index % 5 == 4 else "single",
+                    force_mh=not negative and positive_index < quota.mh_positives,
+                    layout=(
+                        "double"
+                        if not negative and positive_index < quota.double_row_positives
+                        else "single"
+                    ),
                     category=_CATEGORIES[global_index % len(_CATEGORIES)],
-                    condition=_EFFECTS[global_index % len(_EFFECTS)],
+                    condition=conditions[slot],
                 )
             )
             global_index += 1
@@ -257,7 +268,7 @@ def _render_synthetic_spec(
     fonts: Sequence[Path],
 ) -> GenerationResult:
     old_row = previous.get(spec.output_id)
-    if _can_reuse(old_row, output):
+    if _can_reuse(old_row, output, requires_ocr=not spec.negative):
         return GenerationResult(dict(old_row), True)
 
     scene, anchor = _load_scaled_anchor(spec.source, config.max_scene_edge)
@@ -270,6 +281,17 @@ def _render_synthetic_spec(
     ocr_sha256 = ""
     if spec.negative:
         scene = erase_plate(scene, anchor, generator)
+        scene = apply_camera_effects(
+            CompositeResult(
+                image=scene,
+                box=anchor,
+                tags={},
+                keep_detection=False,
+                ocr_eligible=False,
+            ),
+            named_effect_profile(spec.condition, generator),
+            generator,
+        ).image
     else:
         identity = generate_identity(
             generator,
@@ -323,7 +345,7 @@ def _render_synthetic_spec(
             "plate_text": plate_text,
             "plate_style": spec.category if not spec.negative else "removed",
             "plate_layout": spec.layout if not spec.negative else "none",
-            "effect": spec.condition if not spec.negative else "plate_removed",
+            "effect": spec.condition,
             "ocr_eligible": str(ocr_eligible and not spec.negative).lower(),
             "ocr_path": _relative(ocr_path, output) if ocr_path else "",
             "ocr_sha256": ocr_sha256,

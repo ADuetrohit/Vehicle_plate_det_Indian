@@ -8,9 +8,10 @@ from pathlib import Path
 from PIL import Image
 import pytest
 
-from plate_dataset.builder import InsufficientSourceData, build_dataset
-from plate_dataset.config import BuildConfig
-from plate_dataset.manifests import sha256_file
+from plate_dataset.builder import InsufficientSourceData, _synthetic_specs, build_dataset
+from plate_dataset.config import BuildConfig, load_config
+from plate_dataset.manifests import sha256_file, write_manifest
+from plate_dataset.quotas import generation_quotas
 from plate_dataset.records import Box, ImageRecord
 from plate_dataset.split import assign_splits
 
@@ -215,3 +216,77 @@ def test_rejected_output_is_replaced_without_changing_total(tmp_path: Path) -> N
 
     assert rejected not in second_ids
     assert len(second_ids) == 20
+
+def test_synthetic_specs_match_every_default_split_quota_without_rendering() -> None:
+    """Catches global-first allocation that violates per-split planner quotas."""
+    config = load_config(Path("config/default.yaml"))
+    records = [_record(index, family=f"default-family-{index}") for index in range(3)]
+
+    specs = _synthetic_specs(config, records, frozenset())
+    quotas = generation_quotas(config)
+    for split, quota in quotas.items():
+        chosen = [spec for spec in specs if spec.split == split]
+        positives = [spec for spec in chosen if not spec.negative]
+        assert len(chosen) == quota.total
+        assert sum(spec.negative for spec in chosen) == quota.negatives
+        assert sum(spec.force_mh for spec in positives) == quota.mh_positives
+        assert sum(spec.layout == "double" for spec in positives) == quota.double_row_positives
+        assert sum(spec.condition == "night" for spec in chosen) == quota.low_light
+        assert sum(spec.condition == "rain" for spec in chosen) == quota.adverse
+
+
+def test_synthetic_only_manifest_matches_small_split_quotas(tmp_path: Path) -> None:
+    """Catches rendered rows drifting from their deterministic split specifications."""
+    config = _synthetic_only_config(tmp_path / "dataset")
+    records = _write_real_records(tmp_path, 8)
+
+    result = build_dataset(config, records, config.workspace)
+    rows = _manifest_rows(result.manifest_path)
+    quotas = generation_quotas(config)
+    for split, quota in quotas.items():
+        chosen = [row for row in rows if row["split"] == split]
+        positives = [row for row in chosen if row["negative"] == "false"]
+        assert len(chosen) == quota.total
+        assert sum(row["negative"] == "true" for row in chosen) == quota.negatives
+        assert sum(row["state"] == "MH" for row in positives) == quota.mh_positives
+        assert sum(row["plate_layout"] == "double" for row in positives) == quota.double_row_positives
+        assert sum(row["effect"] == "night" for row in chosen) == quota.low_light
+        assert sum(row["effect"] == "rain" for row in chosen) == quota.adverse
+
+
+def test_synthetic_only_resume_requires_crop_linkage_for_positive(tmp_path: Path) -> None:
+    """Catches a positive manifest row being reused after its required crop linkage is removed."""
+    config = _synthetic_only_config(tmp_path / "dataset")
+    records = _write_real_records(tmp_path, 8)
+    first = build_dataset(config, records, config.workspace)
+    rows = _manifest_rows(first.manifest_path)
+    positive = next(row for row in rows if row["ocr_path"])
+    positive["ocr_path"] = ""
+    positive["ocr_sha256"] = ""
+    write_manifest(rows, first.manifest_path)
+
+    resumed = build_dataset(config, records, config.workspace)
+    restored = next(row for row in _manifest_rows(resumed.manifest_path) if row["output_id"] == positive["output_id"])
+
+    assert resumed.reused_count == 19
+    assert restored["ocr_path"]
+    assert restored["ocr_sha256"]
+
+
+def test_synthetic_negative_records_apply_and_report_assigned_conditions(tmp_path: Path) -> None:
+    """Catches inpainted negatives bypassing their assigned camera-condition profile."""
+    config = _synthetic_only_config(tmp_path / "dataset")
+    records = _write_real_records(tmp_path, 8)
+    expected_conditions = {
+        spec.output_id: spec.condition
+        for spec in _synthetic_specs(config, records, frozenset())
+        if spec.negative
+    }
+
+    result = build_dataset(config, records, config.workspace)
+    negatives = [row for row in _manifest_rows(result.manifest_path) if row["negative"] == "true"]
+
+    assert {row["output_id"] for row in negatives} == set(expected_conditions)
+    assert all(row["effect"] == expected_conditions[row["output_id"]] for row in negatives)
+    assert all(not row["ocr_path"] and not row["ocr_sha256"] for row in negatives)
+    assert all((config.workspace / row["label_path"]).read_text(encoding="utf-8") == "" for row in negatives)

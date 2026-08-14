@@ -11,6 +11,7 @@ from PIL import Image
 
 from .config import BuildConfig
 from .manifests import sha256_file
+from .quotas import generation_quotas
 from .split import split_target_counts
 
 
@@ -76,17 +77,17 @@ def _validate_label(
     negative: bool,
     config: BuildConfig,
     issues: list[ValidationIssue],
-) -> None:
+) -> bool:
     try:
         text = label.read_text(encoding="utf-8")
     except OSError as error:
         _issue(issues, "unreadable_label", label, str(error))
-        return
+        return False
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
         if not negative:
             _issue(issues, "unexpected_empty_label", label, "positive image has no plate box")
-        return
+        return False
     if negative:
         _issue(issues, "negative_has_box", label, "hard-negative label must be empty")
     width, height = image_size
@@ -125,6 +126,74 @@ def _validate_label(
                 label,
                 f"line {line_number} becomes {training_width:.2f}x{training_height:.2f} pixels at training size",
             )
+    return True
+
+
+def _validate_synthetic_quotas(
+    rows: list[dict[str, str]],
+    observed_negatives: Counter[str],
+    config: BuildConfig,
+    manifest_path: Path,
+    issues: list[ValidationIssue],
+) -> None:
+    quotas = generation_quotas(config)
+    for row in rows:
+        if row.get("origin") != "synthetic":
+            _issue(
+                issues,
+                "invalid_synthetic_origin",
+                row.get("output_id", manifest_path),
+                "synthetic-only datasets may contain only synthetic manifest rows",
+            )
+    for split, quota in quotas.items():
+        selected = [row for row in rows if row.get("split") == split]
+        if len(selected) != quota.total:
+            _issue(
+                issues,
+                "synthetic_split_count_mismatch",
+                split,
+                f"manifest has {len(selected)}, expected {quota.total}",
+            )
+        if observed_negatives[split] != quota.negatives:
+            _issue(
+                issues,
+                "negative_count_mismatch",
+                split,
+                f"found {observed_negatives[split]} empty labels, expected {quota.negatives}",
+            )
+        positives = [row for row in selected if row.get("negative", "").lower() != "true"]
+        mh_positives = sum(row.get("state") == "MH" for row in positives)
+        if mh_positives != quota.mh_positives:
+            _issue(
+                issues,
+                "mh_positive_count_mismatch",
+                split,
+                f"found {mh_positives}, expected {quota.mh_positives}",
+            )
+        double_rows = sum(row.get("plate_layout") == "double" for row in positives)
+        if double_rows != quota.double_row_positives:
+            _issue(
+                issues,
+                "double_row_count_mismatch",
+                split,
+                f"found {double_rows}, expected {quota.double_row_positives}",
+            )
+        low_light = sum(row.get("effect") == "night" for row in selected)
+        if low_light != quota.low_light:
+            _issue(
+                issues,
+                "low_light_count_mismatch",
+                split,
+                f"found {low_light}, expected {quota.low_light}",
+            )
+        adverse = sum(row.get("effect") == "rain" for row in selected)
+        if adverse != quota.adverse:
+            _issue(
+                issues,
+                "adverse_condition_count_mismatch",
+                split,
+                f"found {adverse}, expected {quota.adverse}",
+            )
 
 
 def validate_dataset(root: Path, config: BuildConfig) -> ValidationReport:
@@ -148,6 +217,8 @@ def validate_dataset(root: Path, config: BuildConfig) -> ValidationReport:
         (row.get("split", ""), Path(row.get("image_path", "")).stem): row
         for row in rows
     }
+    observed_negatives: Counter[str] = Counter()
+    valid_ocr_crops = 0
 
     for key in sorted(image_by_key.keys() & label_by_key.keys()):
         image_path = image_by_key[key]
@@ -163,7 +234,9 @@ def validate_dataset(root: Path, config: BuildConfig) -> ValidationReport:
             _issue(issues, "unreadable_image", image_path, str(error))
             continue
         negative = bool(row and row.get("negative", "").lower() == "true")
-        _validate_label(label_path, image_size, negative, config, issues)
+        has_box = _validate_label(label_path, image_size, negative, config, issues)
+        if not has_box:
+            observed_negatives[key[0]] += 1
         if row:
             for path, field in ((image_path, "image_sha256"), (label_path, "label_sha256")):
                 expected = row.get(field, "")
@@ -173,6 +246,16 @@ def validate_dataset(root: Path, config: BuildConfig) -> ValidationReport:
             has_text = bool(row.get("plate_text", ""))
             if ocr_eligible and (negative or not has_text):
                 _issue(issues, "invalid_ocr_eligibility", image_path, "OCR eligibility requires a visible plate with known text")
+            if config.synthetic_only and not negative:
+                ocr_path = row.get("ocr_path", "")
+                ocr_checksum = row.get("ocr_sha256", "")
+                crop = root / ocr_path if ocr_path else None
+                if crop is None or not crop.is_file():
+                    _issue(issues, "missing_ocr_crop", image_path, "positive image has no linked OCR crop")
+                elif not ocr_checksum or sha256_file(crop) != ocr_checksum:
+                    _issue(issues, "ocr_checksum_mismatch", crop, "ocr_sha256 does not match manifest")
+                else:
+                    valid_ocr_crops += 1
 
     split_counts = Counter(path.parent.name for path in images)
     targets = split_target_counts(config.target_images, config.split)
@@ -202,12 +285,22 @@ def validate_dataset(root: Path, config: BuildConfig) -> ValidationReport:
         if len(splits) > 1:
             _issue(issues, "cross_split_exact_duplicate", checksum[:12], f"identical image appears in {sorted(splits)}")
 
-    for split in ("val", "test"):
-        selected = [row for row in rows if row.get("split") == split]
-        if selected:
-            real_share = sum(row.get("origin") == "real" for row in selected) / len(selected)
-            if real_share < 0.80:
-                _issue(issues, "real_holdout_share", split, f"real share is {real_share:.3f}, below 0.80")
+    if config.synthetic_only:
+        _validate_synthetic_quotas(rows, observed_negatives, config, manifest_path, issues)
+        if config.target_images == 50_000 and valid_ocr_crops < 46_250:
+            _issue(
+                issues,
+                "ocr_crop_count_mismatch",
+                root / "ocr" / "images",
+                f"found {valid_ocr_crops} valid crops, expected at least 46250",
+            )
+    else:
+        for split in ("val", "test"):
+            selected = [row for row in rows if row.get("split") == split]
+            if selected:
+                real_share = sum(row.get("origin") == "real" for row in selected) / len(selected)
+                if real_share < 0.80:
+                    _issue(issues, "real_holdout_share", split, f"real share is {real_share:.3f}, below 0.80")
 
     known_positive = [
         row

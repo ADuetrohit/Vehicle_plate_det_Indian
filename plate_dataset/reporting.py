@@ -47,6 +47,13 @@ def _read_boxes(path: Path) -> list[tuple[float, float, float, float]]:
     return boxes
 
 
+def _caption(row: dict[str, str]) -> str:
+    """Return the safe QA caption without registration text or source filenames."""
+    return " | ".join(
+        (row.get("output_id", "?"), row.get("plate_style", "?"), row.get("effect", "?"))
+    )
+
+
 def _draw_sample(root: Path, row: dict[str, str], size: tuple[int, int]) -> Image.Image:
     image_path = root / row["image_path"]
     label_path = root / row["label_path"]
@@ -70,17 +77,7 @@ def _draw_sample(root: Path, row: dict[str, str], size: tuple[int, int]) -> Imag
         x2 = offset_x + (x + width / 2) * resized.width
         y2 = offset_y + (y + height / 2) * resized.height
         draw.rectangle((x1, y1, x2, y2), outline="#00ff5a", width=2)
-    # Privacy: captions deliberately omit plate_text and output filenames.
-    caption = " | ".join(
-        (
-            row.get("split", "?"),
-            row.get("origin", "?"),
-            row.get("vehicle_type", "?"),
-            row.get("viewpoint", "?"),
-            row.get("plate_style", "?"),
-            row.get("effect", "?"),
-        )
-    )
+    caption = _caption(row)
     draw.text((5, size[1] - 22), caption[:52], fill="white", font=ImageFont.load_default())
     return canvas
 
@@ -103,11 +100,15 @@ def make_contact_sheets(
     columns = max(1, math.ceil(math.sqrt(samples_per_sheet)))
     rows_per_sheet = math.ceil(samples_per_sheet / columns)
     cell_size = (320, 208)
-    for split in ("train", "val", "test"):
-        selected = sorted(
-            (row for row in rows if row.get("split") == split),
-            key=lambda row: row.get("output_id", ""),
-        )[:samples_per_sheet]
+    groups: dict[tuple[str, str, str, str], list[dict[str, str]]] = {}
+    for row in rows:
+        key = tuple(
+            row.get(field, "unknown") or "unknown"
+            for field in ("split", "plate_style", "plate_layout", "effect")
+        )
+        groups.setdefault(key, []).append(row)
+    for (split, style, layout, condition), group in sorted(groups.items()):
+        selected = sorted(group, key=lambda row: row.get("output_id", ""))[:samples_per_sheet]
         if not selected:
             continue
         sheet = Image.new(
@@ -118,7 +119,7 @@ def make_contact_sheets(
         for index, row in enumerate(selected):
             sample = _draw_sample(root, row, cell_size)
             sheet.paste(sample, ((index % columns) * cell_size[0], (index // columns) * cell_size[1]))
-        path = output_dir / f"{split}.jpg"
+        path = output_dir / f"{split}-{style}-{layout}-{condition}.jpg"
         sheet.save(path, format="JPEG", quality=90)
         paths.append(path)
     return paths

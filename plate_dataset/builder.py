@@ -337,6 +337,21 @@ def _prepare_synthetic_jobs(
     return jobs
 
 
+def _compatible_previous_rows(
+    specs: Sequence[GenerationSpec],
+    previous: Mapping[str, Mapping[str, str]],
+    output: Path,
+) -> dict[str, dict[str, str]]:
+    compatible = {}
+    for spec in specs:
+        row = previous.get(spec.output_id)
+        if _matches_synthetic_spec(row, spec) and _can_reuse(
+            row, output, requires_ocr=not spec.negative
+        ):
+            compatible[spec.output_id] = dict(row)
+    return compatible
+
+
 def _render_synthetic_spec(
     config: BuildConfig,
     spec: GenerationSpec,
@@ -498,7 +513,8 @@ def _build_synthetic_only(
     manifest_path = output / "metadata" / "generation_manifest.csv"
     previous = load_manifest(manifest_path)
     specs = _synthetic_specs(config, records, rejected_ids)
-    jobs = _prepare_synthetic_jobs(config, specs, records, output, previous)
+    durable_previous = _compatible_previous_rows(specs, previous, output)
+    jobs = _prepare_synthetic_jobs(config, specs, records, output, durable_previous)
     fonts = discover_font_paths()
     rows: list[dict[str, object]] = []
     reused = 0
@@ -509,7 +525,11 @@ def _build_synthetic_only(
             reused += 1
         rows.append(result.row)
         if len(rows) % _CHECKPOINT_INTERVAL == 0:
-            write_manifest(rows, manifest_path)
+            checkpoint_rows: dict[str, Mapping[str, object]] = dict(durable_previous)
+            checkpoint_rows.update(
+                (str(row["output_id"]), row) for row in rows
+            )
+            write_manifest(checkpoint_rows.values(), manifest_path)
         if progress is not None:
             progress(len(rows), len(jobs))
 
@@ -521,7 +541,7 @@ def _build_synthetic_only(
                     config,
                     job.spec,
                     output,
-                    previous,
+                    durable_previous,
                     set(),
                     fonts,
                     job.identity,
@@ -534,7 +554,7 @@ def _build_synthetic_only(
         executor = ProcessPoolExecutor(
             max_workers=workers,
             initializer=_initialize_synthetic_worker,
-            initargs=(config, output, previous, fonts),
+            initargs=(config, output, durable_previous, fonts),
         )
         pending: dict[Future[GenerationResult], GenerationJob] = {}
         job_iterator = iter(jobs)

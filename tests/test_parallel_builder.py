@@ -11,6 +11,7 @@ import pytest
 import plate_dataset.builder as builder
 from plate_dataset.builder import BuildManifest, build_dataset
 from plate_dataset.config import BuildConfig
+from plate_dataset.manifests import write_manifest
 from plate_dataset.records import Box, ImageRecord
 
 
@@ -146,3 +147,49 @@ def test_failed_build_checkpoints_five_rows_and_resumes_them(
     assert {row["output_id"] for row in checkpoint_rows} <= {
         row["output_id"] for row in final_rows
     }
+
+
+def test_repeated_resume_preserves_non_prefix_durable_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a later partial checkpoint dropping valid rows from an earlier checkpoint."""
+    records = _write_records(tmp_path)
+    output = tmp_path / "dataset"
+    config = replace(_config(output), workers=1)
+    initial = build_dataset(config, records, output)
+    initial_by_id = {
+        row["output_id"]: row for row in _manifest_projection(initial)
+    }
+    specs = builder._synthetic_specs(config, records, frozenset())
+    prior_ids = {spec.output_id for spec in specs[5:]}
+    write_manifest(
+        [initial_by_id[output_id] for output_id in prior_ids],
+        initial.manifest_path,
+    )
+
+    original_renderer = builder._render_synthetic_spec
+    completed = 0
+
+    def fail_after_seven_results(*args: object, **kwargs: object):
+        nonlocal completed
+        if completed == 7:
+            raise InjectedRenderFailure("second interruption")
+        result = original_renderer(*args, **kwargs)
+        completed += 1
+        return result
+
+    monkeypatch.setattr(builder, "_CHECKPOINT_INTERVAL", 5)
+    monkeypatch.setattr(builder, "_render_synthetic_spec", fail_after_seven_results)
+
+    with pytest.raises(RuntimeError, match="InjectedRenderFailure"):
+        build_dataset(config, records, output)
+
+    checkpoint_rows = _manifest_projection(initial)
+    expected_ids = prior_ids | {spec.output_id for spec in specs[:5]}
+    assert {row["output_id"] for row in checkpoint_rows} == expected_ids
+
+    monkeypatch.setattr(builder, "_render_synthetic_spec", original_renderer)
+    final = build_dataset(config, records, output)
+
+    assert final.generated_count == config.target_images
+    assert final.reused_count == config.target_images

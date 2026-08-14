@@ -52,6 +52,36 @@ def assign_splits(
     grouped: dict[str, list[ImageRecord]] = defaultdict(list)
     for record in records:
         grouped[record.source_family].append(record)
+    if config.synthetic_only:
+        pool_targets = split_target_counts(len(records), config.split)
+        families = sorted(
+            grouped,
+            key=lambda family: hashlib.sha256(
+                f"{config.seed}:{family}".encode("utf-8")
+            ).hexdigest(),
+        )
+        chosen: dict[SplitName, list[str]] = {"train": [], "val": [], "test": []}
+        counts: dict[SplitName, int] = {"train": 0, "val": 0, "test": 0}
+        for index, family in enumerate(families):
+            unfilled = [split for split in chosen if not chosen[split]]
+            if len(unfilled) == len(families) - index:
+                split = unfilled[0]
+            else:
+                split = max(
+                    chosen,
+                    key=lambda candidate: (
+                        pool_targets[candidate] - counts[candidate],
+                        candidate == "train",
+                    ),
+                )
+            chosen[split].append(family)
+            counts[split] += len(grouped[family])
+        return {
+            record.record_id: SplitAssignment(split, family)
+            for split, family_names in chosen.items()
+            for family in family_names
+            for record in grouped[family]
+        }
     remaining = set(grouped)
     chosen: dict[SplitName, list[str]] = {"train": [], "val": [], "test": []}
     counts: dict[SplitName, int] = {"train": 0, "val": 0, "test": 0}

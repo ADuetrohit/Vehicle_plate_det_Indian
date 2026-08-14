@@ -68,6 +68,18 @@ def test_split_keeps_source_family_together(tmp_path: Path) -> None:
 
     assert all(len(splits) == 1 for splits in by_family.values())
 
+def test_synthetic_only_assigns_all_source_families_without_real_holdout(tmp_path: Path):
+    config = replace(_config(tmp_path, target=50), synthetic_only=True)
+    records = [_record(i, is_real=True) for i in range(20)]
+    assignments = assign_splits(records, config)
+    assert set(assignments) == {record.record_id for record in records}
+    assert {item.split for item in assignments.values()} == {"train", "val", "test"}
+    assert Counter(item.split for item in assignments.values()) == {"train": 16, "val": 2, "test": 2}
+    by_family = defaultdict(set)
+    for record in records:
+        by_family[record.source_family].add(assignments[record.record_id].split)
+    assert all(len(values) == 1 for values in by_family.values())
+
 
 def test_split_fails_when_real_holdout_requirement_is_impossible(tmp_path: Path) -> None:
     """Catches silently weakening the real validation/test requirement."""

@@ -53,6 +53,8 @@ def assign_splits(
     grouped: dict[str, list[ImageRecord]] = defaultdict(list)
     for record in records:
         grouped[record.source_family].append(record)
+    if config.synthetic_only and len(grouped) < 3:
+        raise InsufficientSourceData("synthetic-only allocation requires at least three source families")
     if config.synthetic_only:
         pool_targets = split_target_counts(len(records), config.split)
         families = sorted(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import AbstractSet
+from typing import AbstractSet, Iterable
 
 import numpy as np
 
@@ -44,12 +44,14 @@ def generate_identity(
     rng: np.random.Generator,
     mh_probability: float,
     forbidden: AbstractSet[str],
+    *,
+    forbidden_is_normalized: bool = False,
 ) -> PlateIdentity:
     if not 0.0 <= mh_probability <= 1.0:
         raise ValueError("mh_probability must be between zero and one")
-    forbidden_compact = {
-        re.sub(r"[^A-Za-z0-9]", "", value).upper() for value in forbidden
-    }
+    forbidden_compact = (
+        forbidden if forbidden_is_normalized else normalize_registrations(forbidden)
+    )
     for _ in range(10_000):
         state = "MH" if rng.random() < mh_probability else str(rng.choice(OTHER_STATE_PREFIXES))
         district_limit = 58 if state == "MH" else 99
@@ -69,4 +71,12 @@ def generate_identity(
             display_lines=(f"{state} {district} {series} {number}",),
         )
     raise RuntimeError("could not generate a fictitious registration")
+
+
+def normalize_registration(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", value).upper()
+
+
+def normalize_registrations(values: Iterable[str]) -> set[str]:
+    return {normalized for value in values if (normalized := normalize_registration(value))}
 

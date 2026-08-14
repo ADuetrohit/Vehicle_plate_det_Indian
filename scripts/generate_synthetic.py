@@ -16,6 +16,7 @@ if __package__ in {None, ""}:
 
 from plate_dataset.builder import (
     _compatible_previous_rows,
+    _load_rejection_tombstones,
     _synthetic_specs,
     build_dataset,
 )
@@ -25,6 +26,7 @@ from plate_dataset.ocr_export import merge_ocr_labels
 from plate_dataset.ocr_import import import_existing_ocr, write_ocr_labels
 from plate_dataset.quotas import generation_quotas
 from plate_dataset.records import Box, ImageRecord
+from plate_dataset.registration import normalize_registration
 from plate_dataset.storage import (
     InsufficientStorage,
     StorageEstimate,
@@ -145,10 +147,18 @@ def _pending_output_count(
     records: list[ImageRecord],
     previous: dict[str, dict[str, str]],
     rejected: frozenset[str],
+    tombstones: dict[str, list[dict[str, object]]],
+    forbidden_plate_texts: frozenset[str],
 ) -> int:
     if not previous:
         return config.target_images
-    specs = _synthetic_specs(config, records, rejected)
+    specs = _synthetic_specs(
+        config,
+        records,
+        rejected,
+        forbidden_plate_texts=forbidden_plate_texts,
+        tombstones=tombstones,
+    )
     compatible = _compatible_previous_rows(specs, previous, config.workspace)
     return config.target_images - len(compatible)
 
@@ -161,6 +171,44 @@ def _rejected_artifacts(
     paths: set[Path] = set()
     for output_id in sorted(rejected):
         paths.update(_required_artifacts(workspace, previous[output_id]))
+        row = previous[output_id]
+        split = row.get("split", "")
+        if split in {"train", "val", "test"}:
+            paths.add(workspace / "ocr" / "images" / split / f"{output_id}.jpg")
+    return tuple(sorted(paths))
+
+
+def _tombstoned_rejected_artifacts(
+    workspace: Path,
+    tombstones: dict[str, list[dict[str, object]]],
+    rejected: frozenset[str],
+) -> tuple[Path, ...]:
+    paths: set[Path] = set()
+    for logical_slot, entries in tombstones.items():
+        split = logical_slot.partition(":")[0]
+        if split not in {"train", "val", "test"}:
+            raise ValueError(f"invalid rejection tombstone slot: {logical_slot}")
+        for entry in entries:
+            output_id = str(entry["candidate_id"])
+            if output_id not in rejected:
+                continue
+            if re.fullmatch(r"syn-[0-9a-f]{20}", output_id) is None:
+                raise ValueError(f"invalid rejection tombstone candidate: {output_id}")
+            paths.update(
+                {
+                    workspace
+                    / "detection"
+                    / "images"
+                    / split
+                    / f"{output_id}.jpg",
+                    workspace
+                    / "detection"
+                    / "labels"
+                    / split
+                    / f"{output_id}.txt",
+                    workspace / "ocr" / "images" / split / f"{output_id}.jpg",
+                }
+            )
     return tuple(sorted(paths))
 
 
@@ -214,11 +262,7 @@ def _merge_ocr_corpora(config, archive: Path, manifest_path: Path) -> int:
     labels = config.workspace / "ocr" / "labels.csv"
     temporary_existing = labels.with_name(f".{labels.stem}.existing.tmp.csv")
     try:
-        if archive.is_file():
-            existing_records = import_existing_ocr(archive, config.workspace / "ocr")
-            write_ocr_labels(existing_records, temporary_existing)
-        else:
-            _write_existing_only(labels, temporary_existing)
+        _write_existing_only(labels, temporary_existing)
         return merge_ocr_labels(
             temporary_existing,
             _synthetic_ocr_rows(manifest_path),
@@ -227,6 +271,31 @@ def _merge_ocr_corpora(config, archive: Path, manifest_path: Path) -> int:
     finally:
         if temporary_existing.exists():
             temporary_existing.unlink()
+
+
+def _existing_ocr_texts(labels: Path) -> frozenset[str]:
+    with labels.open(newline="", encoding="utf-8") as handle:
+        try:
+            rows = list(csv.DictReader(handle))
+        except csv.Error as error:
+            raise ValueError(f"cannot read preserved OCR labels: {error}") from error
+    return frozenset(
+        normalized
+        for row in rows
+        if row.get("synthetic", "").strip().lower() != "true"
+        and (normalized := normalize_registration(row.get("plate_text", "")))
+    )
+
+
+def _prepare_existing_ocr_corpus(config: BuildConfig, archive: Path) -> frozenset[str]:
+    labels = config.workspace / "ocr" / "labels.csv"
+    if not labels.is_file():
+        records = import_existing_ocr(archive, config.workspace / "ocr")
+        write_ocr_labels(records, labels)
+    texts = _existing_ocr_texts(labels)
+    if not texts:
+        raise ValueError("preserved OCR labels contain no accepted registrations")
+    return texts
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -244,6 +313,12 @@ def main(argv: list[str] | None = None) -> int:
     records = _load_records(record_path, config.workspace)
     manifest_path = config.workspace / "metadata" / "generation_manifest.csv"
     previous = load_manifest(manifest_path)
+    tombstone_path = config.workspace / "metadata" / "rejected_generation_slots.json"
+    try:
+        tombstones = _load_rejection_tombstones(tombstone_path)
+    except ValueError as error:
+        print(f"Rejected output tombstones are invalid: {error}", file=sys.stderr)
+        return 2
     rejected: frozenset[str] = frozenset()
     rejected_artifacts: tuple[Path, ...] = ()
     if args.reject_file:
@@ -259,18 +334,50 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as error:
             print(f"Reject file could not be read: {error}", file=sys.stderr)
             return 2
-        unknown = sorted(rejected - previous.keys())
+        tombstoned_ids = {
+            str(entry["candidate_id"])
+            for entries in tombstones.values()
+            for entry in entries
+        }
+        unknown = sorted(rejected - previous.keys() - tombstoned_ids)
         if unknown:
             print(f"Unknown rejected output IDs: {','.join(unknown)}", file=sys.stderr)
             return 2
         try:
             rejected_artifacts = _rejected_artifacts(
-                config.workspace, previous, rejected
+                config.workspace, previous, rejected & previous.keys()
+            )
+            rejected_artifacts = tuple(
+                sorted(
+                    set(rejected_artifacts)
+                    | set(
+                        _tombstoned_rejected_artifacts(
+                            config.workspace, tombstones, rejected
+                        )
+                    )
+                )
             )
         except ValueError as error:
             print(f"Rejected artifact cleanup refused: {error}", file=sys.stderr)
             return 2
-    pending_outputs = _pending_output_count(config, records, previous, rejected)
+    ocr_labels_path = config.workspace / "ocr" / "labels.csv"
+    try:
+        pending_forbidden_texts = (
+            _existing_ocr_texts(ocr_labels_path)
+            if ocr_labels_path.is_file()
+            else frozenset()
+        )
+    except (OSError, ValueError) as error:
+        print(f"Preserved OCR preparation failed: {error}", file=sys.stderr)
+        return 2
+    pending_outputs = _pending_output_count(
+        config,
+        records,
+        previous,
+        rejected,
+        tombstones,
+        pending_forbidden_texts,
+    )
     try:
         estimate, free_bytes = _storage_preflight(
             config, records, pending_outputs
@@ -296,8 +403,22 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    archive = args.ocr_archive or config.workspace.parent / "archive.zip"
+    if not ocr_labels_path.is_file() and not archive.is_file():
+        print(
+            "Required preserved OCR data is unavailable: provide --ocr-archive or an existing "
+            "ocr/labels.csv before generation.",
+            file=sys.stderr,
+        )
+        return 2
     if rejected:
         print("Rejected IDs will be replaced during this resumable build.")
+
+    try:
+        forbidden_plate_texts = _prepare_existing_ocr_corpus(config, archive)
+    except (OSError, ValueError) as error:
+        print(f"Preserved OCR preparation failed: {error}", file=sys.stderr)
+        return 2
 
     def progress(completed: int, total: int) -> None:
         if completed % 500 == 0:
@@ -309,9 +430,9 @@ def main(argv: list[str] | None = None) -> int:
         config.workspace,
         rejected_ids=rejected,
         progress=progress,
+        forbidden_plate_texts=forbidden_plate_texts,
     )
 
-    archive = args.ocr_archive or config.workspace.parent / "archive.zip"
     try:
         ocr_labels = _merge_ocr_corpora(config, archive, manifest.manifest_path)
     except (OSError, ValueError) as error:

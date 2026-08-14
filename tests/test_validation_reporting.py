@@ -96,11 +96,26 @@ def _write_manifest_rows(root: Path, rows: list[dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
+def _ocr_rows(root: Path) -> list[dict[str, str]]:
+    with (root / "ocr" / "labels.csv").open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _write_ocr_rows(root: Path, rows: list[dict[str, str]]) -> None:
+    labels = root / "ocr" / "labels.csv"
+    labels.parent.mkdir(parents=True, exist_ok=True)
+    with labels.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 @pytest.fixture
 def synthetic_fixture(tmp_path: Path) -> SyntheticFixture:
     root = tmp_path / "synthetic"
     config = replace(_config(root), synthetic_only=True)
     rows: list[dict[str, str]] = []
+    ocr_rows: list[dict[str, str]] = []
     specs = (
         ("train", True, "", "none", "removed", "night"),
         ("train", False, "MH", "single", "private", "day"),
@@ -108,8 +123,8 @@ def synthetic_fixture(tmp_path: Path) -> SyntheticFixture:
         ("train", False, "MH", "single", "private", "night"),
         ("train", False, "MH", "double", "private", "rain"),
         ("train", False, "MH", "single", "private", "rain"),
-        ("train", False, "DL", "single", "private", "day"),
-        ("train", False, "DL", "single", "private", "day"),
+        ("train", False, "DL", "single", "private", "distance"),
+        ("train", False, "DL", "single", "private", "occlusion"),
         ("val", False, "DL", "single", "private", "day"),
         ("test", False, "MH", "single", "private", "day"),
     )
@@ -150,12 +165,27 @@ def synthetic_fixture(tmp_path: Path) -> SyntheticFixture:
                 "plate_style": style,
                 "plate_layout": layout,
                 "effect": condition,
+                "detector_eligible": str(not negative).lower(),
                 "ocr_eligible": str(not negative).lower(),
                 "ocr_path": ocr_path,
                 "ocr_sha256": ocr_sha256,
             }
         )
+        if not negative:
+            ocr_rows.append(
+                {
+                    "image_name": crop.name,
+                    "image_path": crop.relative_to(root / "ocr").as_posix(),
+                    "plate_text": f"MH12AB{index:04d}",
+                    "split": split,
+                    "source_id": "synthetic",
+                    "synthetic": "true",
+                    "reconciliation": "generated",
+                    "output_id": output_id,
+                }
+            )
     _write_manifest_rows(root, rows)
+    _write_ocr_rows(root, ocr_rows)
     assert positive_crop is not None
     return SyntheticFixture(root, config, positive_crop)
 
@@ -265,7 +295,7 @@ def test_validator_rejects_duplicate_manifest_output_ids(
 
 
 def test_validator_requires_default_ocr_crop_floor(synthetic_fixture: SyntheticFixture) -> None:
-    """Catches a nominal 50,000-image build with fewer than 46,250 valid OCR crops."""
+    """Catches a default build omitting synthetic crops or 2,122 preserved rows."""
     default_config = replace(
         synthetic_fixture.config,
         target_images=50_000,
@@ -276,6 +306,8 @@ def test_validator_requires_default_ocr_crop_floor(synthetic_fixture: SyntheticF
     report = validate_dataset(synthetic_fixture.root, default_config)
 
     assert any(issue.code == "ocr_crop_count_mismatch" for issue in report.issues)
+    assert any(issue.code == "synthetic_ocr_count_mismatch" for issue in report.issues)
+    assert any(issue.code == "existing_ocr_count_mismatch" for issue in report.issues)
 
 
 def test_validator_enforces_exact_negative_quota(synthetic_fixture: SyntheticFixture) -> None:
@@ -343,6 +375,101 @@ def test_validator_enforces_adverse_condition_quota(synthetic_fixture: Synthetic
     assert any(issue.code == "adverse_condition_count_mismatch" for issue in report.issues)
 
 
+def test_validator_enforces_distance_condition_quota(synthetic_fixture: SyntheticFixture) -> None:
+    """Catches distance scenes being omitted while the manifest still validates."""
+    rows = _manifest_rows(synthetic_fixture.root)
+    _first_row(rows, split="train", effect="distance")["effect"] = "day"
+    _write_manifest_rows(synthetic_fixture.root, rows)
+
+    report = validate_dataset(synthetic_fixture.root, synthetic_fixture.config)
+
+    assert any(issue.code == "distance_condition_count_mismatch" for issue in report.issues)
+
+
+def test_validator_enforces_occlusion_condition_quota(synthetic_fixture: SyntheticFixture) -> None:
+    """Catches partial-occlusion scenes being omitted while the manifest still validates."""
+    rows = _manifest_rows(synthetic_fixture.root)
+    _first_row(rows, split="train", effect="occlusion")["effect"] = "day"
+    _write_manifest_rows(synthetic_fixture.root, rows)
+
+    report = validate_dataset(synthetic_fixture.root, synthetic_fixture.config)
+
+    assert any(issue.code == "occlusion_condition_count_mismatch" for issue in report.issues)
+
+
+def test_validator_enforces_detector_eligibility_manifest_field(
+    synthetic_fixture: SyntheticFixture,
+) -> None:
+    """Catches a positive label being emitted while detector eligibility is false."""
+    rows = _manifest_rows(synthetic_fixture.root)
+    _first_row(rows, negative="false")["detector_eligible"] = "false"
+    _write_manifest_rows(synthetic_fixture.root, rows)
+
+    report = validate_dataset(synthetic_fixture.root, synthetic_fixture.config)
+
+    assert any(issue.code == "detector_eligibility_mismatch" for issue in report.issues)
+
+
+def test_validator_requires_exact_synthetic_ocr_csv_linkage(
+    synthetic_fixture: SyntheticFixture,
+) -> None:
+    """Catches OCR CSV text disagreeing with its positive manifest row."""
+    rows = _ocr_rows(synthetic_fixture.root)
+    rows[0]["plate_text"] = "DL01AA0001"
+    _write_ocr_rows(synthetic_fixture.root, rows)
+
+    report = validate_dataset(synthetic_fixture.root, synthetic_fixture.config)
+
+    assert any(issue.code == "ocr_label_mismatch" for issue in report.issues)
+
+
+def test_validator_rejects_duplicate_and_orphan_synthetic_ocr_rows(
+    synthetic_fixture: SyntheticFixture,
+) -> None:
+    """Catches duplicated output links and synthetic labels with no manifest positive."""
+    rows = _ocr_rows(synthetic_fixture.root)
+    rows.append(dict(rows[0]))
+    orphan = dict(rows[0])
+    orphan.update(
+        {
+            "image_name": "orphan.jpg",
+            "image_path": "images/train/orphan.jpg",
+            "output_id": "syn-orphan",
+        }
+    )
+    rows.append(orphan)
+    crop = synthetic_fixture.root / "ocr" / "images" / "train" / "orphan.jpg"
+    Image.new("RGB", (256, 128), (90, 90, 90)).save(crop)
+    _write_ocr_rows(synthetic_fixture.root, rows)
+
+    report = validate_dataset(synthetic_fixture.root, synthetic_fixture.config)
+
+    codes = {issue.code for issue in report.issues}
+    assert "duplicate_ocr_label" in codes
+    assert "orphan_synthetic_ocr_row" in codes
+
+
+def test_validator_checks_synthetic_crop_dimensions_and_unlisted_crops(
+    synthetic_fixture: SyntheticFixture,
+) -> None:
+    """Catches malformed or unlisted crop files surviving corpus validation."""
+    Image.new("RGB", (100, 50), (20, 30, 40)).save(synthetic_fixture.positive_crop)
+    rows = _manifest_rows(synthetic_fixture.root)
+    target = next(
+        row for row in rows if synthetic_fixture.root / row["ocr_path"] == synthetic_fixture.positive_crop
+    )
+    target["ocr_sha256"] = sha256_file(synthetic_fixture.positive_crop)
+    _write_manifest_rows(synthetic_fixture.root, rows)
+    unlisted = synthetic_fixture.root / "ocr" / "images" / "train" / "unlisted.jpg"
+    Image.new("RGB", (256, 128), (50, 60, 70)).save(unlisted)
+
+    report = validate_dataset(synthetic_fixture.root, synthetic_fixture.config)
+
+    codes = {issue.code for issue in report.issues}
+    assert "invalid_ocr_crop_dimensions" in codes
+    assert "unlisted_ocr_crop" in codes
+
+
 def test_contact_sheet_caption_uses_safe_sample_metadata() -> None:
     """Catches captions that reveal a registration number instead of safe QA metadata."""
     caption = _caption(
@@ -386,6 +513,8 @@ def test_contact_sheets_group_by_split_style_layout_and_condition(
     assert {path.name for path in sheets} >= {
         "train-private-double-night.jpg",
         "train-private-single-rain.jpg",
+        "train-private-single-distance.jpg",
+        "train-private-single-occlusion.jpg",
         "val-private-single-day.jpg",
         "test-private-single-day.jpg",
     }

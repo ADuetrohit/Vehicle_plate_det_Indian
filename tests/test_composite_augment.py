@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from plate_dataset.augment import EffectProfile, apply_camera_effects, named_effect_profile
-from plate_dataset.composite import composite_plate, erase_plate
+from plate_dataset.composite import CompositeResult, composite_plate, erase_plate
 from plate_dataset.records import Box
 from plate_dataset.registration import PlateIdentity
 from plate_dataset.render import PlateStyle, discover_font_paths, render_plate
@@ -97,6 +97,68 @@ def test_camera_effects_are_deterministic() -> None:
 
     assert np.array_equal(first.image, second.image)
     assert first.tags == second.tags
+
+
+def test_distance_profile_reduces_detail_without_moving_detector_box() -> None:
+    """Catches a distance metadata label that applies no real image degradation."""
+    result = composite_plate(
+        _scene(), Box(0, 20, 20, 180, 70), _plate(), np.random.default_rng(2)
+    )
+    try:
+        profile = named_effect_profile("distance", np.random.default_rng(11))
+    except ValueError:
+        profile = EffectProfile(name="distance")
+
+    assert getattr(profile, "distance_scale", 1.0) < 1.0
+    degraded = apply_camera_effects(result, profile, np.random.default_rng(44))
+    original_detail = sum(
+        np.abs(np.diff(result.image.astype(np.float32), axis=axis)).mean()
+        for axis in (0, 1)
+    )
+    degraded_detail = sum(
+        np.abs(np.diff(degraded.image.astype(np.float32), axis=axis)).mean()
+        for axis in (0, 1)
+    )
+
+    assert degraded.image.shape == result.image.shape
+    assert degraded.box == result.box
+    assert degraded.keep_detection == result.keep_detection
+    assert degraded_detail < original_detail
+    assert degraded.tags["effect"] == "distance"
+
+
+def test_occlusion_profile_changes_only_part_of_visible_plate_interior() -> None:
+    """Catches fake occlusion metadata or an overlay that hides the detector boundary."""
+    image = np.full((120, 240, 3), 30, dtype=np.uint8)
+    box = Box(0, 60, 40, 180, 80)
+    image[40:80, 60:180] = 220
+    result = CompositeResult(
+        image=image,
+        box=box,
+        tags={},
+        keep_detection=True,
+        ocr_eligible=True,
+    )
+    try:
+        profile = named_effect_profile("occlusion", np.random.default_rng(11))
+    except ValueError:
+        profile = EffectProfile(name="occlusion")
+
+    assert 0.0 < getattr(profile, "occlusion", 0.0) < 0.5
+    first = apply_camera_effects(result, profile, np.random.default_rng(44))
+    second = apply_camera_effects(result, profile, np.random.default_rng(44))
+    changed = np.any(first.image != image, axis=2)
+    changed_y, changed_x = np.nonzero(changed)
+
+    assert np.array_equal(first.image, second.image)
+    assert first.box == box
+    assert changed_x.size > 0
+    assert changed_x.min() > box.x_min and changed_x.max() < box.x_max - 1
+    assert changed_y.min() > box.y_min and changed_y.max() < box.y_max - 1
+    assert changed.sum() < (box.x_max - box.x_min) * (box.y_max - box.y_min) * 0.5
+    assert np.array_equal(first.image[40, 60:180], image[40, 60:180])
+    assert np.array_equal(first.image[79, 60:180], image[79, 60:180])
+    assert first.tags["effect"] == "occlusion"
 
 
 @pytest.mark.parametrize("name", ["day", "night", "rain", "fog", "glare", "shadow", "motion", "compression"])

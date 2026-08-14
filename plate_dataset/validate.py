@@ -4,7 +4,7 @@ from collections import Counter, defaultdict
 import csv
 from dataclasses import dataclass
 import math
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal, Mapping
 
 from PIL import Image
@@ -80,56 +80,66 @@ def _validate_label(
     negative: bool,
     config: BuildConfig,
     issues: list[ValidationIssue],
-) -> bool:
+) -> tuple[bool, bool]:
     try:
         text = label.read_text(encoding="utf-8")
     except OSError as error:
         _issue(issues, "unreadable_label", label, str(error))
-        return False
+        return False, False
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
         if not negative:
             _issue(issues, "unexpected_empty_label", label, "positive image has no plate box")
-        return False
+        return False, False
+    detector_eligible = not negative
     if negative:
         _issue(issues, "negative_has_box", label, "hard-negative label must be empty")
+        detector_eligible = False
     width, height = image_size
     scale = config.training_imgsz / max(width, height)
     for line_number, line in enumerate(lines, start=1):
         values = line.split()
         if len(values) != 5:
             _issue(issues, "invalid_yolo_row", label, f"line {line_number} must contain five values")
+            detector_eligible = False
             continue
         try:
             class_value, x, y, box_width, box_height = map(float, values)
         except ValueError:
             _issue(issues, "invalid_yolo_row", label, f"line {line_number} is not numeric")
+            detector_eligible = False
             continue
         numbers = (class_value, x, y, box_width, box_height)
         if not all(math.isfinite(value) for value in numbers):
             _issue(issues, "non_finite_coordinate", label, f"line {line_number} contains NaN or infinity")
+            detector_eligible = False
             continue
         if class_value != 0:
             _issue(issues, "invalid_class", label, f"line {line_number} uses class {class_value:g}, expected 0")
+            detector_eligible = False
         if not all(0.0 <= value <= 1.0 for value in (x, y, box_width, box_height)):
             _issue(issues, "coordinate_out_of_range", label, f"line {line_number} contains a coordinate outside [0, 1]")
+            detector_eligible = False
             continue
         if box_width <= 0 or box_height <= 0:
             _issue(issues, "non_positive_box", label, f"line {line_number} has non-positive size")
+            detector_eligible = False
             continue
         if x - box_width / 2 < 0 or x + box_width / 2 > 1 or y - box_height / 2 < 0 or y + box_height / 2 > 1:
             _issue(issues, "box_out_of_bounds", label, f"line {line_number} extends beyond its image")
+            detector_eligible = False
         training_width = box_width * width * scale
         training_height = box_height * height * scale
         minimum_width, minimum_height = config.min_box_at_training_size
         if training_width < minimum_width or training_height < minimum_height:
+            detector_eligible = False
             _issue(
                 issues,
                 "box_below_training_minimum",
                 label,
                 f"line {line_number} becomes {training_width:.2f}x{training_height:.2f} pixels at training size",
             )
-    return True
+    return True, detector_eligible
 
 
 def _validate_synthetic_quotas(
@@ -196,6 +206,22 @@ def _validate_synthetic_quotas(
                 "adverse_condition_count_mismatch",
                 split,
                 f"found {adverse}, expected {quota.adverse}",
+            )
+        distance = sum(row.get("effect") == "distance" for row in selected)
+        if distance != quota.distance:
+            _issue(
+                issues,
+                "distance_condition_count_mismatch",
+                split,
+                f"found {distance}, expected {quota.distance}",
+            )
+        occlusion = sum(row.get("effect") == "occlusion" for row in positives)
+        if occlusion != quota.occlusion:
+            _issue(
+                issues,
+                "occlusion_condition_count_mismatch",
+                split,
+                f"found {occlusion}, expected {quota.occlusion}",
             )
 
 
@@ -292,6 +318,174 @@ def _validate_synthetic_manifest_rows(
     return valid_crops
 
 
+def _validate_ocr_corpus(
+    root: Path,
+    manifest_rows: list[dict[str, str]],
+    config: BuildConfig,
+    issues: list[ValidationIssue],
+) -> None:
+    labels_path = root / "ocr" / "labels.csv"
+    if not labels_path.is_file():
+        _issue(issues, "missing_ocr_labels", labels_path, "OCR labels CSV is missing")
+        return
+    try:
+        with labels_path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = set(reader.fieldnames or [])
+            ocr_rows = list(reader)
+    except (OSError, csv.Error) as error:
+        _issue(issues, "invalid_ocr_labels", labels_path, f"cannot read OCR labels: {error}")
+        return
+    required_fields = {
+        "image_name",
+        "image_path",
+        "plate_text",
+        "split",
+        "source_id",
+        "synthetic",
+        "output_id",
+    }
+    if not required_fields <= fieldnames:
+        _issue(
+            issues,
+            "invalid_ocr_labels",
+            labels_path,
+            "OCR labels CSV is missing required columns",
+        )
+        return
+
+    positives = {
+        row.get("output_id", ""): row
+        for row in manifest_rows
+        if row.get("negative", "").lower() != "true"
+        and row.get("output_id", "")
+    }
+    synthetic_by_output: dict[str, list[dict[str, str]]] = defaultdict(list)
+    listed_paths: set[str] = set()
+    preserved_count = 0
+    synthetic_count = 0
+    for row_number, row in enumerate(ocr_rows, start=2):
+        synthetic = row.get("synthetic", "").strip().lower() == "true"
+        if synthetic:
+            synthetic_count += 1
+            synthetic_by_output[row.get("output_id", "")].append(row)
+        else:
+            preserved_count += 1
+
+        relative = PurePosixPath(row.get("image_path", ""))
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or len(relative.parts) < 3
+            or relative.parts[0] != "images"
+            or relative.parts[1] not in _SPLITS
+            or not relative.name
+        ):
+            _issue(
+                issues,
+                "invalid_ocr_label_path",
+                labels_path,
+                f"row {row_number} has an unsafe or noncanonical image_path",
+            )
+            continue
+        full_relative = PurePosixPath("ocr", *relative.parts).as_posix()
+        listed_paths.add(full_relative)
+        crop = root.joinpath(*PurePosixPath(full_relative).parts)
+        if not crop.is_file():
+            _issue(issues, "missing_ocr_label_crop", crop, "OCR CSV row crop is missing")
+        else:
+            try:
+                with Image.open(crop) as image:
+                    image.load()
+                    crop_size = image.size
+            except (OSError, ValueError) as error:
+                _issue(issues, "unreadable_ocr_crop", crop, str(error))
+            else:
+                if synthetic and crop_size != config.ocr_canvas:
+                    _issue(
+                        issues,
+                        "invalid_ocr_crop_dimensions",
+                        crop,
+                        f"synthetic crop is {crop_size}, expected {config.ocr_canvas}",
+                    )
+
+        if not synthetic:
+            continue
+        output_id = row.get("output_id", "")
+        manifest_row = positives.get(output_id)
+        if manifest_row is None:
+            _issue(
+                issues,
+                "orphan_synthetic_ocr_row",
+                labels_path,
+                f"row {row_number} output_id {output_id!r} has no positive manifest row",
+            )
+            continue
+        expected_relative = PurePosixPath(manifest_row.get("ocr_path", ""))
+        try:
+            expected_image_path = expected_relative.relative_to("ocr").as_posix()
+        except ValueError:
+            expected_image_path = ""
+        if (
+            row.get("plate_text", "") != manifest_row.get("plate_text", "")
+            or row.get("split", "") != manifest_row.get("split", "")
+            or row.get("image_path", "") != expected_image_path
+            or row.get("image_name", "") != expected_relative.name
+        ):
+            _issue(
+                issues,
+                "ocr_label_mismatch",
+                labels_path,
+                f"row {row_number} does not match manifest output {output_id}",
+            )
+
+    for output_id, manifest_row in positives.items():
+        matching = synthetic_by_output.get(output_id, [])
+        if not matching:
+            _issue(
+                issues,
+                "missing_ocr_label",
+                manifest_row.get("ocr_path", output_id),
+                "positive manifest row has no synthetic OCR CSV row",
+            )
+        elif len(matching) != 1:
+            _issue(
+                issues,
+                "duplicate_ocr_label",
+                labels_path,
+                f"output {output_id} appears in {len(matching)} synthetic OCR rows",
+            )
+
+    for crop in sorted((root / "ocr" / "images").glob("*/*.jpg")):
+        relative = crop.relative_to(root).as_posix()
+        if relative not in listed_paths:
+            _issue(
+                issues,
+                "unlisted_ocr_crop",
+                crop,
+                "OCR crop is not listed in ocr/labels.csv",
+            )
+
+    required_synthetic = sum(
+        quota.positives for quota in generation_quotas(config).values()
+    )
+    if synthetic_count < required_synthetic:
+        _issue(
+            issues,
+            "synthetic_ocr_count_mismatch",
+            labels_path,
+            f"found {synthetic_count} synthetic rows, expected at least {required_synthetic}",
+        )
+    required_preserved = 2_122 if config.target_images == 50_000 else 0
+    if preserved_count < required_preserved:
+        _issue(
+            issues,
+            "existing_ocr_count_mismatch",
+            labels_path,
+            f"found {preserved_count} preserved rows, expected at least {required_preserved}",
+        )
+
+
 def validate_dataset(root: Path, config: BuildConfig) -> ValidationReport:
     root = Path(root)
     issues: list[ValidationIssue] = []
@@ -314,6 +508,8 @@ def validate_dataset(root: Path, config: BuildConfig) -> ValidationReport:
         if config.synthetic_only
         else set()
     )
+    if config.synthetic_only:
+        _validate_ocr_corpus(root, rows, config, issues)
     row_by_key = {
         (row.get("split", ""), Path(row.get("image_path", "")).stem): row
         for row in rows
@@ -334,7 +530,9 @@ def validate_dataset(root: Path, config: BuildConfig) -> ValidationReport:
             _issue(issues, "unreadable_image", image_path, str(error))
             continue
         negative = bool(row and row.get("negative", "").lower() == "true")
-        has_box = _validate_label(label_path, image_size, negative, config, issues)
+        has_box, label_detector_eligible = _validate_label(
+            label_path, image_size, negative, config, issues
+        )
         if not has_box:
             observed_negatives[key[0]] += 1
         if row:
@@ -343,6 +541,25 @@ def validate_dataset(root: Path, config: BuildConfig) -> ValidationReport:
                 if not expected or sha256_file(path) != expected:
                     _issue(issues, "checksum_mismatch", path, f"{field} does not match manifest")
             ocr_eligible = row.get("ocr_eligible", "").lower() == "true"
+            if config.synthetic_only:
+                detector_value = row.get("detector_eligible", "").lower()
+                expected_detector_value = str(
+                    not negative and label_detector_eligible
+                ).lower()
+                if detector_value != expected_detector_value:
+                    _issue(
+                        issues,
+                        "detector_eligibility_mismatch",
+                        image_path,
+                        f"manifest has {detector_value!r}, expected {expected_detector_value}",
+                    )
+                if not negative and has_box and not label_detector_eligible:
+                    _issue(
+                        issues,
+                        "ineligible_positive_label",
+                        label_path,
+                        "positive label contains a detector-ineligible box",
+                    )
             has_text = bool(row.get("plate_text", ""))
             if ocr_eligible and (negative or not has_text):
                 _issue(issues, "invalid_ocr_eligibility", image_path, "OCR eligibility requires a visible plate with known text")

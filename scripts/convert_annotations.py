@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -12,8 +14,10 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from plate_dataset.archives import safe_extract_zip
-from plate_dataset.config import load_config
-from plate_dataset.ingest import ingest_source
+from plate_dataset.config import BuildConfig, load_config
+from plate_dataset.dedupe import perceptual_family
+from plate_dataset.ingest import RejectedSourceRecord, ingest_source
+from plate_dataset.records import ImageRecord
 from plate_dataset.sources import SourceSpec, source_registry
 
 
@@ -63,6 +67,104 @@ def _license_is_allowed(spec: SourceSpec, license_dir: Path) -> bool:
     return isinstance(decision, dict) and decision.get("decision") == "allowed"
 
 
+def _resized_geometry(
+    record: ImageRecord, config: BuildConfig
+) -> tuple[float, int, int]:
+    resize_scale = min(
+        1.0, config.max_scene_edge / max(record.width, record.height)
+    )
+    resized_width = max(1, round(record.width * resize_scale))
+    resized_height = max(1, round(record.height * resize_scale))
+    return resize_scale, resized_width, resized_height
+
+
+def _scaled_primary_size(
+    record: ImageRecord, config: BuildConfig
+) -> tuple[float, float] | None:
+    resize_scale, resized_width, resized_height = _resized_geometry(record, config)
+    candidates: list[tuple[float, float]] = []
+    for box in record.boxes:
+        scaled_width = (
+            min(box.x_max * resize_scale, resized_width)
+            - max(box.x_min * resize_scale, 0.0)
+        )
+        scaled_height = (
+            min(box.y_max * resize_scale, resized_height)
+            - max(box.y_min * resize_scale, 0.0)
+        )
+        if scaled_width >= 8 and scaled_height >= 4:
+            candidates.append((scaled_width, scaled_height))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda size: size[0] * size[1])
+
+
+def _training_anchor_rejection_reason(
+    record: ImageRecord, config: BuildConfig
+) -> str | None:
+    primary_size = _scaled_primary_size(record, config)
+    if primary_size is None:
+        return (
+            "no primary anchor survives the 8x4-pixel compositing gate after "
+            f"max-scene-edge {config.max_scene_edge} resize"
+        )
+    _, resized_width, resized_height = _resized_geometry(record, config)
+    training_scale = config.training_imgsz / max(resized_width, resized_height)
+    minimum_width, minimum_height = config.min_box_at_training_size
+    if (
+        primary_size[0] * training_scale >= minimum_width
+        and primary_size[1] * training_scale >= minimum_height
+    ):
+        return None
+    return (
+        f"no primary anchor reaches {minimum_width}x{minimum_height} pixels at "
+        f"{config.training_imgsz}-pixel training size after max-scene-edge "
+        f"{config.max_scene_edge} resize"
+    )
+
+
+def _relative_path(path: Path, workspace: Path) -> str:
+    try:
+        return path.relative_to(workspace).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _write_rejected_records(
+    rejected_records: list[RejectedSourceRecord], output: Path, workspace: Path
+) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.tmp")
+    rows = {
+        (
+            rejected.source_id,
+            _relative_path(rejected.image_path, workspace),
+            rejected.reason,
+        )
+        for rejected in rejected_records
+    }
+    try:
+        with temporary.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle, fieldnames=("source_id", "image_path", "reason")
+            )
+            writer.writeheader()
+            for source_id, image_path, reason in sorted(
+                rows, key=lambda row: (row[1], row[0], row[2])
+            ):
+                writer.writerow(
+                    {
+                        "source_id": source_id,
+                        "image_path": image_path,
+                        "reason": reason,
+                    }
+                )
+        os.replace(temporary, output)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     config = load_config(args.config)
@@ -90,18 +192,42 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    records = []
+    records: list[ImageRecord] = []
+    rejected_records: list[RejectedSourceRecord] = []
     for archive in archives:
         spec = specs.get(archive.parent.name)
         if spec is None:
             continue
         destination = raw / "extracted" / archive.parent.name
         safe_extract_zip(archive, destination)
-        try:
-            records.extend(ingest_source(destination, spec))
-        except ValueError as error:
-            print(f"{spec.slug}: {error}", file=sys.stderr)
-            return 2
+        records.extend(
+            ingest_source(
+                destination, spec, rejected_records=rejected_records
+            )
+        )
+    eligible_records: list[ImageRecord] = []
+    for record in records:
+        rejection_reason = _training_anchor_rejection_reason(record, config)
+        if rejection_reason is None:
+            eligible_records.append(record)
+        else:
+            rejected_records.append(
+                RejectedSourceRecord(
+                    source_id=record.source_id,
+                    image_path=record.image_path,
+                    reason=rejection_reason,
+                )
+            )
+    records = eligible_records
+    families = perceptual_family(records)
+    records = [
+        replace(record, source_family=families[record.record_id])
+        for record in records
+    ]
+    rejected_output = (
+        config.workspace / "metadata" / "rejected_source_records.csv"
+    )
+    _write_rejected_records(rejected_records, rejected_output, config.workspace)
     if not records:
         print("No valid image-label pairs were normalized.", file=sys.stderr)
         return 2

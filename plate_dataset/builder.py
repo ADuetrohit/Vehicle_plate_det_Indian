@@ -4,10 +4,11 @@ from collections import Counter, defaultdict
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import AbstractSet, Callable, Mapping, Sequence
 
 import numpy as np
 from PIL import Image
@@ -17,9 +18,9 @@ from .composite import CompositeResult, composite_plate, erase_plate
 from .config import BuildConfig
 from .manifests import load_manifest, sha256_file, write_manifest
 from .ocr_export import export_ocr_crop
-from .quotas import generation_quotas
+from .quotas import generation_quotas, generation_slot_plan
 from .records import Box, ImageRecord
-from .registration import PlateIdentity, generate_identity
+from .registration import PlateIdentity, generate_identity, normalize_registrations
 from .render import PlateStyle, discover_font_paths, render_plate
 from .split import SplitName, assign_splits, split_target_counts
 
@@ -46,6 +47,8 @@ _CATEGORIES = (
 )
 _EFFECTS = ("day", "night", "rain", "fog", "glare", "shadow", "motion", "compression")
 _CHECKPOINT_INTERVAL = 100
+_GENERATION_PROFILE_VERSION = "synthetic-v2"
+_REJECTION_TOMBSTONE_VERSION = 1
 
 
 def _stable_hex(*values: object) -> str:
@@ -54,6 +57,53 @@ def _stable_hex(*values: object) -> str:
 
 def _rng(seed: int, *values: object) -> np.random.Generator:
     return np.random.default_rng(int(_stable_hex(seed, *values)[:16], 16))
+
+
+def _generation_profile_sha256(
+    config: BuildConfig,
+    records: Sequence[ImageRecord],
+    forbidden_plate_texts: AbstractSet[str],
+) -> str:
+    source_membership = [
+        {
+            "record_id": record.record_id,
+            "source_id": record.source_id,
+            "source_family": record.source_family,
+            "width": record.width,
+            "height": record.height,
+            "boxes": [
+                [box.class_id, box.x_min, box.y_min, box.x_max, box.y_max]
+                for box in record.boxes
+            ],
+            "is_real": record.is_real,
+            "plate_text": record.plate_text or "",
+            "tags": dict(sorted(record.tags.items())),
+        }
+        for record in sorted(records, key=lambda item: item.record_id)
+    ]
+    payload = {
+        "profile_version": _GENERATION_PROFILE_VERSION,
+        "config": {
+            "seed": config.seed,
+            "target_images": config.target_images,
+            "max_images": config.max_images,
+            "mh_share": list(config.mh_share),
+            "split": list(config.split),
+            "negative_share": list(config.negative_share),
+            "training_imgsz": config.training_imgsz,
+            "min_box_at_training_size": list(config.min_box_at_training_size),
+            "synthetic_only": config.synthetic_only,
+            "max_scene_edge": config.max_scene_edge,
+            "jpeg_quality": config.jpeg_quality,
+            "ocr_canvas": list(config.ocr_canvas),
+        },
+        "source_membership": source_membership,
+        "forbidden_plate_texts": sorted(forbidden_plate_texts),
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _format_labels(boxes: Sequence[Box], width: int, height: int) -> str:
@@ -69,6 +119,70 @@ def _write_text_atomic(path: Path, value: str) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(value, encoding="utf-8")
     os.replace(temporary, path)
+
+
+def _load_rejection_tombstones(path: Path) -> dict[str, list[dict[str, object]]]:
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read rejection tombstones: {error}") from error
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != _REJECTION_TOMBSTONE_VERSION
+        or not isinstance(payload.get("slots"), dict)
+    ):
+        raise ValueError("rejection tombstones have an unsupported schema")
+    result: dict[str, list[dict[str, object]]] = {}
+    for logical_slot, raw_entries in payload["slots"].items():
+        if not isinstance(logical_slot, str) or not isinstance(raw_entries, list):
+            raise ValueError("rejection tombstones contain an invalid slot entry")
+        entries: list[dict[str, object]] = []
+        for raw_entry in raw_entries:
+            if (
+                not isinstance(raw_entry, dict)
+                or not isinstance(raw_entry.get("candidate_id"), str)
+                or not isinstance(raw_entry.get("attempt"), int)
+                or int(raw_entry["attempt"]) < 0
+            ):
+                raise ValueError("rejection tombstones contain an invalid candidate")
+            entries.append(
+                {
+                    "candidate_id": str(raw_entry["candidate_id"]),
+                    "attempt": int(raw_entry["attempt"]),
+                }
+            )
+        result[logical_slot] = sorted(entries, key=lambda entry: int(entry["attempt"]))
+    return result
+
+
+def _write_rejection_tombstones(
+    tombstones: Mapping[str, Sequence[Mapping[str, object]]], path: Path
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": _REJECTION_TOMBSTONE_VERSION,
+        "slots": {
+            logical_slot: [
+                {
+                    "candidate_id": str(entry["candidate_id"]),
+                    "attempt": int(entry["attempt"]),
+                }
+                for entry in sorted(entries, key=lambda item: int(item["attempt"]))
+            ]
+            for logical_slot, entries in sorted(tombstones.items())
+        },
+    }
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _save_jpeg_atomic(image: np.ndarray | Image.Image, path: Path, quality: int = 92) -> None:
@@ -140,6 +254,7 @@ def _base_row(
         "plate_style": "original" if not negative else "removed",
         "plate_layout": source.tags.get("plate_layout", "unknown"),
         "effect": "original",
+        "detector_eligible": str(not negative).lower(),
         "ocr_eligible": str(bool(source.plate_text and not negative)).lower(),
     }
 
@@ -162,6 +277,10 @@ class GenerationSpec:
     layout: str
     category: str
     condition: str
+    generation_profile_sha256: str
+    source_image_sha256: str
+    logical_slot_id: str
+    candidate_attempt: int
 
 
 @dataclass(frozen=True)
@@ -181,7 +300,19 @@ def _synthetic_specs(
     config: BuildConfig,
     records: Sequence[ImageRecord],
     rejected_ids: frozenset[str],
+    *,
+    forbidden_plate_texts: AbstractSet[str] = frozenset(),
+    tombstones: Mapping[str, Sequence[Mapping[str, object]]] | None = None,
 ) -> list[GenerationSpec]:
+    generation_profile = _generation_profile_sha256(
+        config, records, forbidden_plate_texts
+    )
+    source_hashes = {
+        record.record_id: (
+            sha256_file(record.image_path) if record.image_path.is_file() else ""
+        )
+        for record in records
+    }
     assignments = assign_splits(records, config)
     grouped: dict[SplitName, dict[str, list[ImageRecord]]] = {
         "train": defaultdict(list), "val": defaultdict(list), "test": defaultdict(list)
@@ -204,23 +335,24 @@ def _synthetic_specs(
                 f"split {split} has no source scene from which to create variants"
             )
         next_variant = {family: 0 for family in family_names}
-        conditions = (
-            ["night"] * quota.low_light
-            + ["rain"] * quota.adverse
-            + ["day", "fog", "glare", "shadow", "motion", "compression"]
-            * ((quota.total - quota.low_light - quota.adverse + 5) // 6)
-        )
+        slot_plan = generation_slot_plan(config, split)
         for slot in range(quota.total):
             family = family_names[slot % len(family_names)]
-            variant_index = next_variant[family]
+            base_variant = next_variant[family]
+            next_variant[family] = base_variant + 1
+            logical_slot_id = f"{split}:{slot:08d}"
+            entries = (tombstones or {}).get(logical_slot_id, ())
+            candidate_attempt = max(
+                (int(entry["attempt"]) for entry in entries), default=-1
+            ) + 1
+            variant_index = base_variant + candidate_attempt * max(1, quota.total)
             output_id = f"syn-{_stable_hex(config.seed, split, family, variant_index)[:20]}"
             while output_id in rejected_ids:
-                variant_index += 1
+                candidate_attempt += 1
+                variant_index = base_variant + candidate_attempt * max(1, quota.total)
                 output_id = f"syn-{_stable_hex(config.seed, split, family, variant_index)[:20]}"
-            next_variant[family] = variant_index + 1
             source = grouped[split][family][variant_index % len(grouped[split][family])]
-            negative = slot < quota.negatives
-            positive_index = slot - quota.negatives
+            negative = slot in slot_plan.negative_slots
             specs.append(
                 GenerationSpec(
                     output_id=output_id,
@@ -229,21 +361,66 @@ def _synthetic_specs(
                     global_index=global_index,
                     variant_index=variant_index,
                     negative=negative,
-                    force_mh=not negative and positive_index < quota.mh_positives,
+                    force_mh=slot in slot_plan.mh_positive_slots,
                     layout=(
                         "double"
-                        if not negative and positive_index < quota.double_row_positives
+                        if slot in slot_plan.double_row_positive_slots
                         else "single"
                     ),
                     category=_CATEGORIES[global_index % len(_CATEGORIES)],
-                    condition=conditions[slot],
+                    condition=slot_plan.conditions[slot],
+                    generation_profile_sha256=generation_profile,
+                    source_image_sha256=source_hashes[source.record_id],
+                    logical_slot_id=logical_slot_id,
+                    candidate_attempt=candidate_attempt,
                 )
             )
             global_index += 1
     return specs
 
 
-def _load_scaled_anchor(source: ImageRecord, max_scene_edge: int) -> tuple[np.ndarray, Box]:
+def _persist_rejected_candidates(
+    config: BuildConfig,
+    records: Sequence[ImageRecord],
+    rejected_ids: AbstractSet[str],
+    forbidden_plate_texts: AbstractSet[str],
+    tombstones: dict[str, list[dict[str, object]]],
+    path: Path,
+) -> None:
+    if not rejected_ids:
+        return
+    current_specs = _synthetic_specs(
+        config,
+        records,
+        frozenset(),
+        forbidden_plate_texts=forbidden_plate_texts,
+        tombstones=tombstones,
+    )
+    current_by_id = {spec.output_id: spec for spec in current_specs}
+    already_rejected = {
+        str(entry["candidate_id"])
+        for entries in tombstones.values()
+        for entry in entries
+    }
+    unknown = sorted(set(rejected_ids) - current_by_id.keys() - already_rejected)
+    if unknown:
+        raise ValueError(f"unknown rejected output IDs: {','.join(unknown)}")
+    changed = False
+    for output_id in sorted(rejected_ids):
+        if output_id in already_rejected:
+            continue
+        spec = current_by_id[output_id]
+        tombstones.setdefault(spec.logical_slot_id, []).append(
+            {"candidate_id": output_id, "attempt": spec.candidate_attempt}
+        )
+        changed = True
+    if changed:
+        _write_rejection_tombstones(tombstones, path)
+
+
+def _load_scaled_anchor(
+    source: ImageRecord, max_scene_edge: int
+) -> tuple[np.ndarray, Box, tuple[Box, ...]]:
     with Image.open(source.image_path) as image:
         image = image.convert("RGB")
         width, height = image.size
@@ -252,7 +429,8 @@ def _load_scaled_anchor(source: ImageRecord, max_scene_edge: int) -> tuple[np.nd
         if resized_size != image.size:
             image = image.resize(resized_size, Image.Resampling.LANCZOS)
         scene = np.asarray(image, dtype=np.uint8).copy()
-    candidates = []
+    anchors: list[Box] = []
+    candidates: list[Box] = []
     for box in source.boxes:
         scaled = Box(
             box.class_id,
@@ -261,11 +439,16 @@ def _load_scaled_anchor(source: ImageRecord, max_scene_edge: int) -> tuple[np.nd
             box.x_max * scale,
             box.y_max * scale,
         ).clip(scene.shape[1], scene.shape[0])
+        anchors.append(scaled)
         if scaled.x_max - scaled.x_min >= 8 and scaled.y_max - scaled.y_min >= 4:
             candidates.append(scaled)
     if not candidates:
         raise InsufficientSourceData(f"source scene {source.record_id} has no valid plate anchor")
-    return scene, max(candidates, key=lambda box: (box.x_max - box.x_min) * (box.y_max - box.y_min))
+    primary = max(
+        candidates,
+        key=lambda box: (box.x_max - box.x_min) * (box.y_max - box.y_min),
+    )
+    return scene, primary, tuple(anchors)
 
 
 def _matches_synthetic_spec(row: Mapping[str, str] | None, spec: GenerationSpec) -> bool:
@@ -274,7 +457,17 @@ def _matches_synthetic_spec(row: Mapping[str, str] | None, spec: GenerationSpec)
     if (
         row.get("origin") != "synthetic"
         or row.get("split") != spec.split
+        or row.get("source_id") != spec.source.source_id
         or row.get("source_family") != spec.source.source_family
+        or row.get("image_path")
+        != f"detection/images/{spec.split}/{spec.output_id}.jpg"
+        or row.get("label_path")
+        != f"detection/labels/{spec.split}/{spec.output_id}.txt"
+        or row.get("generation_profile_sha256")
+        != spec.generation_profile_sha256
+        or row.get("source_image_sha256") != spec.source_image_sha256
+        or row.get("logical_slot_id") != spec.logical_slot_id
+        or row.get("candidate_attempt") != str(spec.candidate_attempt)
         or row.get("negative") != str(spec.negative).lower()
         or row.get("effect") != spec.condition
     ):
@@ -286,6 +479,7 @@ def _matches_synthetic_spec(row: Mapping[str, str] | None, spec: GenerationSpec)
             and not row.get("state")
             and not row.get("plate_text")
             and not row.get("ocr_path")
+            and row.get("detector_eligible") == "false"
             and row.get("ocr_eligible") == "false"
             and not row.get("ocr_sha256")
         )
@@ -294,7 +488,19 @@ def _matches_synthetic_spec(row: Mapping[str, str] | None, spec: GenerationSpec)
         and row.get("ocr_path") == f"ocr/images/{spec.split}/{spec.output_id}.jpg"
         and row.get("plate_style") == spec.category
         and row.get("plate_layout") == spec.layout
+        and row.get("detector_eligible") == "true"
         and (row.get("state") == "MH") == spec.force_mh
+    )
+
+
+def _meets_training_minimum(
+    box: Box, image_width: int, image_height: int, config: BuildConfig
+) -> bool:
+    scale = config.training_imgsz / max(image_width, image_height)
+    minimum_width, minimum_height = config.min_box_at_training_size
+    return (
+        (box.x_max - box.x_min) * scale >= minimum_width
+        and (box.y_max - box.y_min) * scale >= minimum_height
     )
 
 
@@ -304,11 +510,27 @@ def _prepare_synthetic_jobs(
     records: Sequence[ImageRecord],
     output: Path,
     previous: Mapping[str, Mapping[str, str]],
+    forbidden_plate_texts: AbstractSet[str],
 ) -> list[GenerationJob]:
-    forbidden = {record.plate_text for record in records if record.plate_text}
+    forbidden = normalize_registrations(
+        [
+            *(record.plate_text for record in records if record.plate_text),
+            *forbidden_plate_texts,
+        ]
+    )
+    for spec in specs:
+        old_row = previous.get(spec.output_id)
+        if old_row and not spec.negative:
+            forbidden.update(
+                normalize_registrations(
+                    part
+                    for part in str(old_row.get("plate_text", "")).split("|")
+                    if part
+                )
+            )
     jobs = []
     for spec in specs:
-        if spec.negative:
+        if spec.negative or spec.output_id in previous:
             jobs.append(GenerationJob(spec=spec, identity=None, rng_state=None))
             continue
         generator = _rng(
@@ -318,6 +540,7 @@ def _prepare_synthetic_jobs(
             generator,
             mh_probability=1.0 if spec.force_mh else 0.0,
             forbidden=forbidden,
+            forbidden_is_normalized=True,
         )
         jobs.append(
             GenerationJob(
@@ -326,14 +549,7 @@ def _prepare_synthetic_jobs(
                 rng_state=generator.bit_generator.state,
             )
         )
-        old_row = previous.get(spec.output_id)
-        if _matches_synthetic_spec(old_row, spec) and _can_reuse(
-            old_row, output, requires_ocr=True
-        ):
-            text = str(old_row.get("plate_text", ""))
-            forbidden.update(part for part in text.split("|") if part)
-        else:
-            forbidden.add(identity.compact_text)
+        forbidden.add(identity.compact_text)
     return jobs
 
 
@@ -368,16 +584,20 @@ def _render_synthetic_spec(
     ):
         return GenerationResult(dict(old_row), True)
 
-    scene, anchor = _load_scaled_anchor(spec.source, config.max_scene_edge)
+    scene, anchor, source_anchors = _load_scaled_anchor(
+        spec.source, config.max_scene_edge
+    )
     generator = _rng(config.seed, spec.split, spec.source.source_family, spec.variant_index)
+    for source_anchor in source_anchors:
+        scene = erase_plate(scene, source_anchor, generator)
     final_boxes: list[Box] = []
     plate_text = ""
     state = ""
     ocr_eligible = False
+    detector_eligible = False
     ocr_path: Path | None = None
     ocr_sha256 = ""
     if spec.negative:
-        scene = erase_plate(scene, anchor, generator)
         scene = apply_camera_effects(
             CompositeResult(
                 image=scene,
@@ -424,6 +644,18 @@ def _render_synthetic_spec(
         state = identity.state
         ocr_eligible = effected.ocr_eligible
 
+    if final_boxes:
+        detector_eligible = all(
+            _meets_training_minimum(
+                box, scene.shape[1], scene.shape[0], config
+            )
+            for box in final_boxes
+        )
+        if not detector_eligible:
+            raise InsufficientSourceData(
+                f"synthetic output {spec.output_id} has no detector-eligible plate box"
+            )
+
     image_path, label_path = _paths(output, spec.split, spec.output_id)
     _save_jpeg_atomic(scene, image_path, config.jpeg_quality)
     _write_text_atomic(label_path, _format_labels(final_boxes, scene.shape[1], scene.shape[0]))
@@ -449,6 +681,11 @@ def _render_synthetic_spec(
             "plate_style": spec.category if not spec.negative else "removed",
             "plate_layout": spec.layout if not spec.negative else "none",
             "effect": spec.condition,
+            "generation_profile_sha256": spec.generation_profile_sha256,
+            "source_image_sha256": spec.source_image_sha256,
+            "logical_slot_id": spec.logical_slot_id,
+            "candidate_attempt": spec.candidate_attempt,
+            "detector_eligible": str(detector_eligible).lower(),
             "ocr_eligible": str(ocr_eligible and not spec.negative).lower(),
             "ocr_path": _relative(ocr_path, output) if ocr_path else "",
             "ocr_sha256": ocr_sha256,
@@ -509,12 +746,36 @@ def _build_synthetic_only(
     output: Path,
     rejected_ids: frozenset[str],
     progress: Callable[[int, int], object] | None = None,
+    forbidden_plate_texts: AbstractSet[str] = frozenset(),
 ) -> BuildManifest:
     manifest_path = output / "metadata" / "generation_manifest.csv"
+    tombstone_path = output / "metadata" / "rejected_generation_slots.json"
     previous = load_manifest(manifest_path)
-    specs = _synthetic_specs(config, records, rejected_ids)
+    tombstones = _load_rejection_tombstones(tombstone_path)
+    _persist_rejected_candidates(
+        config,
+        records,
+        rejected_ids,
+        forbidden_plate_texts,
+        tombstones,
+        tombstone_path,
+    )
+    specs = _synthetic_specs(
+        config,
+        records,
+        frozenset(),
+        forbidden_plate_texts=forbidden_plate_texts,
+        tombstones=tombstones,
+    )
     durable_previous = _compatible_previous_rows(specs, previous, output)
-    jobs = _prepare_synthetic_jobs(config, specs, records, output, durable_previous)
+    jobs = _prepare_synthetic_jobs(
+        config,
+        specs,
+        records,
+        output,
+        durable_previous,
+        forbidden_plate_texts,
+    )
     fonts = discover_font_paths()
     rows: list[dict[str, object]] = []
     reused = 0
@@ -607,6 +868,7 @@ def build_dataset(
     output: Path | None = None,
     rejected_ids: frozenset[str] = frozenset(),
     progress: object = None,
+    forbidden_plate_texts: AbstractSet[str] = frozenset(),
 ) -> BuildManifest:
     output = Path(output or config.workspace)
     if not records:
@@ -625,6 +887,7 @@ def build_dataset(
             output,
             frozenset(rejected_ids),
             progress if callable(progress) else None,
+            forbidden_plate_texts,
         )
 
     assignments = assign_splits(records, config)

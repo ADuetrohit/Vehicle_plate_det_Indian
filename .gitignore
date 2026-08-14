@@ -10,7 +10,9 @@ detection/labels/
 ocr/images/
 ocr/labels.csv
 metadata/source_manifest.csv
+metadata/rejected_source_records.csv
 metadata/generation_manifest.csv
+metadata/rejected_generation_slots.json
 metadata/normalized_records.jsonl
 reports/contact_sheets/
 kaggle.json

@@ -5,20 +5,24 @@ from dataclasses import replace
 import io
 import json
 from pathlib import Path
+import random
 import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
 import zipfile
 
-from PIL import Image
+from PIL import Image, ImageDraw
 import pytest
 import yaml
 
 from plate_dataset.builder import BuildManifest, build_dataset
 from plate_dataset.config import load_config
+from plate_dataset.ingest import RejectedSourceRecord
 from plate_dataset.manifests import write_manifest
+from plate_dataset.split import assign_splits
 from plate_dataset.storage import StorageEstimate
+from scripts import convert_annotations as conversion_cli
 from scripts import generate_synthetic
 from scripts import validate_dataset as validation_cli
 
@@ -87,18 +91,47 @@ def _write_normalized_record(workspace: Path, *, count: int = 1) -> Path:
     return workspace / "raw" / "source-000.jpg"
 
 
-def _jpeg_payload(color: tuple[int, int, int]) -> bytes:
+def _jpeg_payload(
+    color: tuple[int, int, int], size: tuple[int, int] = (200, 100)
+) -> bytes:
     output = io.BytesIO()
-    Image.new("RGB", (200, 100), color=color).save(output, format="JPEG")
+    Image.new("RGB", size, color=color).save(output, format="JPEG")
+    return output.getvalue()
+
+
+def _patterned_jpeg_payload(seed: int, *, quality: int = 88) -> bytes:
+    image = Image.new("RGB", (200, 100), color="white")
+    draw = ImageDraw.Draw(image)
+    generator = random.Random(seed)
+    for _ in range(12):
+        x = generator.randrange(0, 180)
+        y = generator.randrange(0, 80)
+        width = generator.randrange(5, 30)
+        height = generator.randrange(5, 20)
+        draw.rectangle(
+            (x, y, x + width, y + height),
+            fill=tuple(generator.randrange(256) for _ in range(3)),
+        )
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=quality)
     return output.getvalue()
 
 
 def _write_yolo_archive(path: Path, image_name: str, *, valid: bool = True) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     label = b"0 0.5 0.5 0.4 0.2\n" if valid else b"1 0.5 0.5 0.4 0.2\n"
+    _write_yolo_archive_records(
+        path, {image_name: (_jpeg_payload((50, 80, 110)), label)}
+    )
+
+
+def _write_yolo_archive_records(
+    path: Path, records: dict[str, tuple[bytes, bytes]]
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr(f"dataset/images/{image_name}.jpg", _jpeg_payload((50, 80, 110)))
-        archive.writestr(f"dataset/labels/{image_name}.txt", label)
+        for image_name, (image, label) in records.items():
+            archive.writestr(f"dataset/images/{image_name}.jpg", image)
+            archive.writestr(f"dataset/labels/{image_name}.txt", label)
 
 
 @pytest.mark.parametrize(
@@ -227,19 +260,19 @@ def test_conversion_excludes_unapproved_source_archives(tmp_path: Path) -> None:
     assert not output.with_name(f".{output.name}.tmp").exists()
 
 
-def test_failed_conversion_preserves_previous_normalized_manifest(tmp_path: Path) -> None:
+def test_conversion_with_no_valid_records_preserves_previous_normalized_manifest(
+    tmp_path: Path,
+) -> None:
     """Catches partial conversion replacing the last complete normalized manifest."""
     workspace = tmp_path / "workspace"
     config = _write_config(tmp_path / "config.yaml", workspace, target_images=10)
-    first = workspace / "raw" / "kedarsai__indian-license-plates-with-labels" / "a.zip"
-    second = (
+    invalid = (
         workspace
         / "raw"
         / "deepakat002__indian-vehicle-number-plate-yolo-annotation"
         / "b.zip"
     )
-    _write_yolo_archive(first, "valid")
-    _write_yolo_archive(second, "invalid", valid=False)
+    _write_yolo_archive(invalid, "invalid", valid=False)
     output = workspace / "metadata" / "normalized_records.jsonl"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("previous-complete-manifest\n", encoding="utf-8")
@@ -254,6 +287,309 @@ def test_failed_conversion_preserves_previous_normalized_manifest(tmp_path: Path
     assert result.returncode == 2
     assert output.read_text(encoding="utf-8") == "previous-complete-manifest\n"
     assert not output.with_name(f".{output.name}.tmp").exists()
+    rejected = workspace / "metadata" / "rejected_source_records.csv"
+    with rejected.open(newline="", encoding="utf-8") as handle:
+        rejected_rows = list(csv.DictReader(handle))
+    assert [Path(row["image_path"]).name for row in rejected_rows] == ["invalid.jpg"]
+    assert "invalid YOLO label row" in rejected_rows[0]["reason"]
+
+
+def test_conversion_rejects_bad_and_training_undersized_records_individually(
+    tmp_path: Path,
+) -> None:
+    """Catches one bad or undersized source anchor aborting or entering generation."""
+    workspace = tmp_path / "workspace"
+    config = _write_config(tmp_path / "config.yaml", workspace, target_images=10)
+    archive = (
+        workspace / "raw" / "kedarsai__indian-license-plates-with-labels" / "a.zip"
+    )
+    image = _jpeg_payload((50, 80, 110), size=(2_000, 1_000))
+    _write_yolo_archive_records(
+        archive,
+        {
+            "good": (image, b"0 0.5 0.5 0.4 0.2\n"),
+            "invalid": (image, b"1 0.5 0.5 0.4 0.2\n"),
+            "undersized": (image, b"0 0.5 0.5 0.02 0.01\n"),
+        },
+    )
+
+    command = [
+        sys.executable,
+        "scripts/convert_annotations.py",
+        "--config",
+        str(config),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    output = workspace / "metadata" / "normalized_records.jsonl"
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [Path(row["image_path"]).name for row in rows] == ["good.jpg"]
+    rejected = workspace / "metadata" / "rejected_source_records.csv"
+    first_bytes = rejected.read_bytes()
+    with rejected.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        rejected_rows = list(reader)
+        assert reader.fieldnames == ["source_id", "image_path", "reason"]
+    assert [Path(row["image_path"]).name for row in rejected_rows] == [
+        "invalid.jpg",
+        "undersized.jpg",
+    ]
+    assert "invalid YOLO label row" in rejected_rows[0]["reason"]
+    assert "8x4" in rejected_rows[1]["reason"]
+    assert "512" in rejected_rows[1]["reason"]
+
+    repeated = subprocess.run(command, capture_output=True, text=True, check=False)
+
+    assert repeated.returncode == 0, repeated.stderr
+    assert rejected.read_bytes() == first_bytes
+    assert not rejected.with_name(f".{rejected.name}.tmp").exists()
+
+
+def test_conversion_rejects_truncated_image_without_dropping_valid_sibling(
+    tmp_path: Path,
+) -> None:
+    """Catches image decode failures escaping only during global perceptual hashing."""
+    workspace = tmp_path / "workspace"
+    config = _write_config(tmp_path / "config.yaml", workspace, target_images=10)
+    archive = (
+        workspace / "raw" / "kedarsai__indian-license-plates-with-labels" / "a.zip"
+    )
+    valid_image = _jpeg_payload((50, 80, 110))
+    assert valid_image.endswith(b"\xff\xd9")
+    _write_yolo_archive_records(
+        archive,
+        {
+            "good": (valid_image, b"0 0.5 0.5 0.4 0.2\n"),
+            "truncated": (valid_image[:-2], b"0 0.5 0.5 0.4 0.2\n"),
+        },
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/convert_annotations.py",
+            "--config",
+            str(config),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    output = workspace / "metadata" / "normalized_records.jsonl"
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [Path(row["image_path"]).name for row in rows] == ["good.jpg"]
+    with (workspace / "metadata" / "rejected_source_records.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        rejected = list(csv.DictReader(handle))
+    assert [Path(row["image_path"]).name for row in rejected] == ["truncated.jpg"]
+    assert "truncated" in rejected[0]["reason"].lower()
+
+
+def test_conversion_rejects_training_eligible_anchor_below_compositing_gate(
+    tmp_path: Path,
+) -> None:
+    """Catches training upscaling hiding an anchor the compositor cannot select."""
+    workspace = tmp_path / "workspace"
+    config = _write_config(tmp_path / "config.yaml", workspace, target_images=10)
+    archive = (
+        workspace / "raw" / "kedarsai__indian-license-plates-with-labels" / "a.zip"
+    )
+    _write_yolo_archive_records(
+        archive,
+        {
+            "good": (
+                _jpeg_payload((50, 80, 110)),
+                b"0 0.5 0.5 0.4 0.2\n",
+            ),
+            "raw-undersized": (
+                _jpeg_payload((80, 110, 50), size=(100, 100)),
+                b"0 0.5 0.5 0.04 0.02\n",
+            ),
+        },
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/convert_annotations.py",
+            "--config",
+            str(config),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    output = workspace / "metadata" / "normalized_records.jsonl"
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [Path(row["image_path"]).name for row in rows] == ["good.jpg"]
+    with (workspace / "metadata" / "rejected_source_records.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        rejected = list(csv.DictReader(handle))
+    assert [Path(row["image_path"]).name for row in rejected] == [
+        "raw-undersized.jpg"
+    ]
+
+
+def test_conversion_rejects_record_when_selected_primary_is_training_undersized(
+    tmp_path: Path,
+) -> None:
+    """Catches a valid secondary masking the selected primary's training height."""
+    workspace = tmp_path / "workspace"
+    config = _write_config(tmp_path / "config.yaml", workspace, target_images=10)
+    archive = (
+        workspace / "raw" / "kedarsai__indian-license-plates-with-labels" / "a.zip"
+    )
+    _write_yolo_archive_records(
+        archive,
+        {
+            "bad-primary": (
+                _jpeg_payload((80, 110, 50), size=(960, 480)),
+                (
+                    b"0 0.5 0.3 0.2083333333 0.0125\n"
+                    b"0 0.5 0.7 0.0166666667 0.0166666667\n"
+                ),
+            ),
+            "good": (
+                _jpeg_payload((50, 80, 110)),
+                b"0 0.5 0.5 0.4 0.2\n",
+            ),
+        },
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/convert_annotations.py",
+            "--config",
+            str(config),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    output = workspace / "metadata" / "normalized_records.jsonl"
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [Path(row["image_path"]).name for row in rows] == ["good.jpg"]
+    with (workspace / "metadata" / "rejected_source_records.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        rejected = list(csv.DictReader(handle))
+    assert [Path(row["image_path"]).name for row in rejected] == [
+        "bad-primary.jpg"
+    ]
+
+
+def test_rejected_source_csv_replace_failure_preserves_previous_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches an interrupted atomic replace destroying the prior rejection audit."""
+    workspace = tmp_path / "workspace"
+    output = workspace / "metadata" / "rejected_source_records.csv"
+    output.parent.mkdir(parents=True)
+    previous = b"source_id,image_path,reason\r\nold,raw/old.jpg,old reason\r\n"
+    output.write_bytes(previous)
+    temporary = output.with_name(f".{output.name}.tmp")
+
+    def fail_replace(source: Path, destination: Path) -> None:
+        assert source == temporary
+        assert destination == output
+        assert b"raw/new.jpg" in source.read_bytes()
+        raise OSError("injected replace failure")
+
+    monkeypatch.setattr(conversion_cli.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="injected replace failure"):
+        conversion_cli._write_rejected_records(
+            [
+                RejectedSourceRecord(
+                    source_id="fixture/source",
+                    image_path=workspace / "raw" / "new.jpg",
+                    reason="new reason",
+                )
+            ],
+            output,
+            workspace,
+        )
+
+    assert output.read_bytes() == previous
+    assert not temporary.exists()
+
+
+def test_conversion_globalizes_cross_archive_family_before_split_assignment(
+    tmp_path: Path,
+) -> None:
+    """Catches duplicate scenes in allowed archives receiving split-unsafe families."""
+    workspace = tmp_path / "workspace"
+    config_path = _write_config(
+        tmp_path / "config.yaml", workspace, target_images=10
+    )
+    first = (
+        workspace / "raw" / "kedarsai__indian-license-plates-with-labels" / "a.zip"
+    )
+    second = (
+        workspace
+        / "raw"
+        / "deepakat002__indian-vehicle-number-plate-yolo-annotation"
+        / "b.zip"
+    )
+    shared_first = _patterned_jpeg_payload(0)
+    shared_second = _patterned_jpeg_payload(0, quality=70)
+    assert shared_first != shared_second
+    label = b"0 0.5 0.5 0.4 0.2\n"
+    _write_yolo_archive_records(
+        first,
+        {
+            "shared-first": (shared_first, label),
+            "unique-first": (_patterned_jpeg_payload(1), label),
+        },
+    )
+    _write_yolo_archive_records(
+        second,
+        {
+            "shared-second": (shared_second, label),
+            "unique-second": (_patterned_jpeg_payload(2), label),
+        },
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/convert_annotations.py",
+            "--config",
+            str(config_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    output = workspace / "metadata" / "normalized_records.jsonl"
+    records = generate_synthetic._load_records(output, workspace)
+    shared = sorted(
+        (
+            record
+            for record in records
+            if record.image_path.stem in {"shared-first", "shared-second"}
+        ),
+        key=lambda record: record.record_id,
+    )
+    assert len(shared) == 2
+    assert shared[0].source_id != shared[1].source_id
+    assert shared[0].source_family == shared[1].source_family
+
+    assignments = assign_splits(records, load_config(config_path))
+
+    assert assignments[shared[0].record_id].split == assignments[shared[1].record_id].split
 
 
 def test_generation_preflight_refuses_before_output_mutation(
@@ -324,9 +660,17 @@ def test_generation_wires_workers_rejects_progress_and_merged_ocr_labels(
         raising=False,
     )
 
-    def fake_build(config, records, output, rejected_ids=frozenset(), progress=None):
+    def fake_build(
+        config,
+        records,
+        output,
+        rejected_ids=frozenset(),
+        progress=None,
+        forbidden_plate_texts=frozenset(),
+    ):
         assert config.workers == 3
         assert rejected_ids == frozenset({rejected_id})
+        assert forbidden_plate_texts == frozenset({"MH12AB1234"})
         assert progress is not None
         for completed in (499, 500, 999, 1000):
             progress(completed, 1000)
@@ -450,10 +794,14 @@ def test_generation_refuses_rejected_artifact_path_outside_workspace(
     assert result == 2
 
 
+@pytest.mark.parametrize("with_tombstone", [False, True])
 def test_generation_resume_preflight_projects_only_missing_outputs(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    with_tombstone: bool,
 ) -> None:
-    """Catches a completed resume requiring free space for a second full dataset."""
+    """Catches preflight diverging from builder fingerprints or persisted retries."""
     workspace = tmp_path / "workspace"
     config = _write_config(
         tmp_path / "config.yaml", workspace, target_images=10, min_free_gb=0
@@ -463,7 +811,34 @@ def test_generation_resume_preflight_projects_only_missing_outputs(
     records = generate_synthetic._load_records(
         workspace / "metadata" / "normalized_records.jsonl", workspace
     )
-    built = build_dataset(replace(loaded, workers=1), records, workspace)
+    existing = workspace / "ocr" / "labels.csv"
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_text(
+        "image_name,image_path,plate_text,split,source_id,synthetic,reconciliation\n"
+        "existing.jpg,images/train/existing.jpg,MH12AB1234,train,existing_archive,false,preserved\n",
+        encoding="utf-8",
+    )
+    forbidden = frozenset({"MH12AB1234"})
+    rejected = frozenset()
+    arguments = ["--config", str(config), "--dry-run"]
+    if with_tombstone:
+        base_spec = generate_synthetic._synthetic_specs(
+            loaded,
+            records,
+            frozenset(),
+            forbidden_plate_texts=forbidden,
+        )[0]
+        rejected = frozenset({base_spec.output_id})
+        reject_file = tmp_path / "rejects.txt"
+        reject_file.write_text(base_spec.output_id + "\n", encoding="utf-8")
+        arguments.extend(["--reject-file", str(reject_file)])
+    built = build_dataset(
+        replace(loaded, workers=1),
+        records,
+        workspace,
+        rejected_ids=rejected,
+        forbidden_plate_texts=forbidden,
+    )
     monkeypatch.setattr(
         generate_synthetic,
         "estimate_storage",
@@ -473,7 +848,7 @@ def test_generation_resume_preflight_projects_only_missing_outputs(
     )
     monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(free=6_000))
 
-    result = generate_synthetic.main(["--config", str(config), "--dry-run"])
+    result = generate_synthetic.main(arguments)
 
     assert result == 0
     assert "projected_storage_bytes=0" in capsys.readouterr().out
@@ -482,7 +857,7 @@ def test_generation_resume_preflight_projects_only_missing_outputs(
         first = next(csv.DictReader(handle))
     (workspace / first["image_path"]).write_bytes(b"corrupt")
 
-    result = generate_synthetic.main(["--config", str(config), "--dry-run"])
+    result = generate_synthetic.main(arguments)
 
     assert result == 0
     assert "projected_storage_bytes=1000" in capsys.readouterr().out

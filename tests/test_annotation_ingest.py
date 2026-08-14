@@ -131,3 +131,42 @@ def test_ingest_source_discovers_matching_yolo_pairs(tmp_path: Path) -> None:
     assert len(records) == 1
     assert records[0].image_path == image
     assert records[0].boxes == (Box(0, 20, 30, 120, 60),)
+
+
+def test_ingest_source_rejects_bad_record_without_dropping_valid_sibling(
+    tmp_path: Path,
+) -> None:
+    """Catches one malformed annotation aborting every valid record in its source."""
+    root = tmp_path / "source"
+    _image(root / "images" / "bad.jpg", color="red")
+    good_image = _image(root / "images" / "good.jpg", color="green")
+    labels = root / "labels"
+    labels.mkdir(parents=True)
+    (labels / "bad.txt").write_text(
+        "1 0.5 0.5 0.4 0.2\n", encoding="utf-8"
+    )
+    (labels / "good.txt").write_text(
+        "0 0.35 0.45 0.5 0.3\n", encoding="utf-8"
+    )
+    spec = SourceSpec("sample/source", "CC0-1.0", "allowed", "yolo", 1)
+    rejected_records = []
+
+    records = ingest_source(
+        root, spec, rejected_records=rejected_records
+    )
+
+    assert [record.image_path for record in records] == [good_image]
+    assert [
+        (
+            rejected.source_id,
+            rejected.image_path.relative_to(root).as_posix(),
+            rejected.reason,
+        )
+        for rejected in rejected_records
+    ] == [
+        (
+            "sample/source",
+            "images/bad.jpg",
+            "invalid YOLO label row in labels/bad.txt: 1 0.5 0.5 0.4 0.2",
+        )
+    ]

@@ -35,6 +35,31 @@ def test_generated_mh_registration_is_valid_and_not_forbidden() -> None:
     assert identity.state == "MH"
 
 
+def test_identity_generation_accepts_a_pre_normalized_forbidden_set_without_iterating() -> None:
+    """Catches the 50,000-row builder re-normalizing its growing forbidden set."""
+
+    class MembershipOnlyForbidden(set[str]):
+        def __iter__(self):
+            raise AssertionError("pre-normalized forbidden registrations must not be scanned")
+
+    first = generate_identity(
+        np.random.default_rng(17),
+        mh_probability=1.0,
+        forbidden=set(),
+        forbidden_is_normalized=True,
+    )
+    forbidden = MembershipOnlyForbidden({first.compact_text})
+
+    replacement = generate_identity(
+        np.random.default_rng(17),
+        mh_probability=1.0,
+        forbidden=forbidden,
+        forbidden_is_normalized=True,
+    )
+
+    assert replacement.compact_text != first.compact_text
+
+
 def test_seeded_batch_hits_maharashtra_target() -> None:
     """Catches a generator that drifts outside the approved 60–70% MH range."""
     rng = np.random.default_rng(20260814)

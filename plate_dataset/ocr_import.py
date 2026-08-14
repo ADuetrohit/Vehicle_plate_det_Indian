@@ -4,6 +4,7 @@ import csv
 from dataclasses import dataclass
 import hashlib
 import io
+import os
 from pathlib import Path, PurePosixPath
 import re
 from typing import Literal, Sequence
@@ -68,7 +69,7 @@ def import_existing_ocr(archive: Path, output_root: Path) -> list[OCRRecord]:
             output_dir.mkdir(parents=True, exist_ok=True)
             output_name = _collision_safe_name(relative, output_dir, payload)
             output_path = output_dir / output_name
-            output_path.write_bytes(payload)
+            _write_bytes_atomic(output_path, payload)
             records.append(
                 OCRRecord(
                     image_name=output_name,
@@ -94,25 +95,31 @@ def write_ocr_labels(records: Sequence[OCRRecord], csv_path: Path) -> None:
         "synthetic",
         "reconciliation",
     ]
-    with csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
-        writer.writeheader()
-        for record in sorted(records, key=lambda item: (item.split, item.image_name)):
-            try:
-                image_path = record.image_path.relative_to(csv_path.parent).as_posix()
-            except ValueError:
-                image_path = record.image_path.as_posix()
-            writer.writerow(
-                {
-                    "image_name": record.image_name,
-                    "image_path": image_path,
-                    "plate_text": record.plate_text,
-                    "split": record.split,
-                    "source_id": record.source_id,
-                    "synthetic": str(record.synthetic).lower(),
-                    "reconciliation": record.reconciliation,
-                }
-            )
+    temporary = csv_path.with_name(f".{csv_path.name}.tmp")
+    try:
+        with temporary.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
+            writer.writeheader()
+            for record in sorted(records, key=lambda item: (item.split, item.image_name)):
+                try:
+                    image_path = record.image_path.relative_to(csv_path.parent).as_posix()
+                except ValueError:
+                    image_path = record.image_path.as_posix()
+                writer.writerow(
+                    {
+                        "image_name": record.image_name,
+                        "image_path": image_path,
+                        "plate_text": record.plate_text,
+                        "split": record.split,
+                        "source_id": record.source_id,
+                        "synthetic": str(record.synthetic).lower(),
+                        "reconciliation": record.reconciliation,
+                    }
+                )
+        os.replace(temporary, csv_path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _read_csv(handle: zipfile.ZipFile, member: str) -> list[dict[str, str]]:
@@ -146,3 +153,13 @@ def _collision_safe_name(
         return candidate
     digest = hashlib.sha256(relative.as_posix().encode("utf-8")).hexdigest()[:10]
     return f"{Path(candidate).stem}_{digest}{Path(candidate).suffix.lower()}"
+
+
+def _write_bytes_atomic(path: Path, payload: bytes) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        temporary.write_bytes(payload)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()

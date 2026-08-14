@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 
 from .composite import CompositeResult
+from .records import Box
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,8 @@ class EffectProfile:
     rain: float = 0.0
     fog: float = 0.0
     glare: float = 0.0
+    distance_scale: float = 1.0
+    occlusion: float = 0.0
 
     def __post_init__(self) -> None:
         if self.brightness <= 0 or self.contrast <= 0:
@@ -31,6 +34,10 @@ class EffectProfile:
             raise ValueError("jpeg_quality must be between 1 and 100")
         if not 0.0 <= self.rain <= 1.0 or not 0.0 <= self.fog <= 1.0 or not 0.0 <= self.glare <= 1.0:
             raise ValueError("rain, fog, and glare must be between zero and one")
+        if not 0.0 < self.distance_scale <= 1.0:
+            raise ValueError("distance_scale must be greater than zero and at most one")
+        if not 0.0 <= self.occlusion < 0.5:
+            raise ValueError("occlusion must be at least zero and less than one half")
 
 
 def named_effect_profile(name: str, rng: np.random.Generator) -> EffectProfile:
@@ -50,6 +57,10 @@ def named_effect_profile(name: str, rng: np.random.Generator) -> EffectProfile:
         return EffectProfile(name, brightness=float(rng.uniform(0.7, 1.0)), motion_blur=int(rng.choice((7, 11, 15, 21))), jpeg_quality=int(rng.integers(50, 86)))
     if name == "compression":
         return EffectProfile(name, brightness=float(rng.uniform(0.8, 1.05)), gaussian_noise=float(rng.uniform(0, 8)), jpeg_quality=int(rng.integers(20, 50)))
+    if name == "distance":
+        return EffectProfile(name, distance_scale=float(rng.uniform(0.25, 0.55)), jpeg_quality=100)
+    if name == "occlusion":
+        return EffectProfile(name, occlusion=float(rng.uniform(0.18, 0.35)), jpeg_quality=100)
     raise ValueError(f"unknown camera effect profile: {name}")
 
 
@@ -64,6 +75,19 @@ def apply_camera_effects(
     if profile.fog > 0:
         image = image * (1.0 - profile.fog * 0.65) + 235.0 * profile.fog * 0.65
     image = np.clip(image, 0, 255).astype(np.uint8)
+    if profile.distance_scale < 1.0:
+        height, width = image.shape[:2]
+        reduced = cv2.resize(
+            image,
+            (
+                max(1, round(width * profile.distance_scale)),
+                max(1, round(height * profile.distance_scale)),
+            ),
+            interpolation=cv2.INTER_AREA,
+        )
+        image = cv2.resize(reduced, (width, height), interpolation=cv2.INTER_LINEAR)
+    if profile.occlusion > 0 and result.keep_detection:
+        image = _apply_partial_occlusion(image, result.box, profile.occlusion, rng)
     if profile.glare > 0:
         image = _apply_glare(image, profile.glare, rng)
     if profile.rain > 0:
@@ -111,6 +135,33 @@ def _apply_rain(
         y = int(rng.integers(0, height))
         length = int(rng.integers(5, max(6, int(8 + 22 * strength))))
         cv2.line(output, (x, y), (min(width - 1, x + 2), min(height - 1, y + length)), (205, 215, 225), 1)
+    return output
+
+
+def _apply_partial_occlusion(
+    image: np.ndarray, box: Box, strength: float, rng: np.random.Generator
+) -> np.ndarray:
+    output = image.copy()
+    height, width = output.shape[:2]
+    x_min = max(0, int(np.floor(box.x_min)) + 1)
+    y_min = max(0, int(np.floor(box.y_min)) + 1)
+    x_max = min(width, int(np.ceil(box.x_max)) - 1)
+    y_max = min(height, int(np.ceil(box.y_max)) - 1)
+    inner_width = x_max - x_min
+    inner_height = y_max - y_min
+    if inner_width < 2 or inner_height < 1:
+        return output
+
+    plate_width = max(1.0, box.x_max - box.x_min)
+    occluder_width = min(inner_width - 1, max(1, round(plate_width * strength)))
+    start_x = int(rng.integers(x_min, x_max - occluder_width + 1))
+    region = output[y_min:y_max, start_x : start_x + occluder_width]
+    mean_colour = region.astype(np.float32).mean(axis=(0, 1))
+    if float(mean_colour.mean()) >= 127.5:
+        colour = mean_colour * float(rng.uniform(0.18, 0.38))
+    else:
+        colour = mean_colour + (255.0 - mean_colour) * float(rng.uniform(0.55, 0.75))
+    region[:] = np.clip(colour, 0, 255).astype(np.uint8)
     return output
 
 

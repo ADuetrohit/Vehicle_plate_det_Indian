@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 from pathlib import Path
 import zipfile
 
 from PIL import Image
+import pytest
 
 from plate_dataset.ocr_import import import_existing_ocr, write_ocr_labels
 
@@ -137,6 +139,32 @@ def test_write_ocr_labels_has_stable_schema(tmp_path: Path) -> None:
     assert rows[0]["synthetic"] == "false"
 
 
+def test_write_ocr_labels_preserves_previous_csv_when_atomic_replace_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches pre-build OCR preparation truncating the durable labels CSV."""
+    archive = _make_ocr_archive(
+        tmp_path / "ocr.zip",
+        {"a.jpg": "MH12AB1234"},
+        train={"a.jpg"},
+        val=set(),
+    )
+    records = import_existing_ocr(archive, tmp_path / "out")
+    labels = tmp_path / "out" / "labels.csv"
+    labels.write_text("previous\n", encoding="utf-8")
+
+    def fail_replace(source: Path, destination: Path) -> None:
+        raise OSError("injected replace failure")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="injected replace failure"):
+        write_ocr_labels(records, labels)
+
+    assert labels.read_text(encoding="utf-8") == "previous\n"
+    assert not labels.with_name(f".{labels.name}.tmp").exists()
+
+
 def test_reimport_reuses_same_output_name(tmp_path: Path) -> None:
     """Catches resumable imports creating suffixed duplicate crop files."""
     archive = _make_ocr_archive(
@@ -152,3 +180,29 @@ def test_reimport_reuses_same_output_name(tmp_path: Path) -> None:
 
     assert second[0].image_name == first[0].image_name == "a.jpg"
     assert list((output / "images" / "train").glob("*.jpg")) == [first[0].image_path]
+
+
+def test_reimport_preserves_existing_crop_when_atomic_replace_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches pre-build archive import truncating a preserved OCR crop."""
+    archive = _make_ocr_archive(
+        tmp_path / "ocr.zip",
+        {"a.jpg": "MH12AB1234"},
+        train={"a.jpg"},
+        val=set(),
+    )
+    output = tmp_path / "out"
+    first = import_existing_ocr(archive, output)
+    original = first[0].image_path.read_bytes()
+
+    def fail_replace(source: Path, destination: Path) -> None:
+        raise OSError("injected crop replace failure")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="injected crop replace failure"):
+        import_existing_ocr(archive, output)
+
+    assert first[0].image_path.read_bytes() == original
+    assert not first[0].image_path.with_name(f".{first[0].image_path.name}.tmp").exists()

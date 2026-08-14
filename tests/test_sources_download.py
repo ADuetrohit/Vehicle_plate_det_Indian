@@ -113,6 +113,33 @@ def test_verify_source_downloads_after_explicit_local_approval(tmp_path: Path) -
     assert result.sha256 is not None and len(result.sha256) == 64
 
 
+def test_download_uses_an_executable_kaggle_cli_when_path_is_not_configured(
+    tmp_path: Path,
+) -> None:
+    """Catches a virtual-environment CLI becoming unreachable through PATH."""
+    spec = next(x for x in source_registry() if x.license_status == "allowed")
+
+    def successful_runner(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        executable = Path(command[0])
+        assert executable.is_file(), "downloader must invoke a concrete Kaggle executable"
+        output = Path(command[command.index("-p") + 1])
+        output.mkdir(parents=True, exist_ok=True)
+        _write_zip(output / "download.zip", {"labels/a.txt": b"0 0.5 0.5 0.1 0.1"})
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    result = download_source(
+        spec,
+        tmp_path / "downloads",
+        tmp_path / "credentials",
+        tmp_path / "licenses",
+        runner=successful_runner,
+    )
+
+    assert result.status == "downloaded"
+
+
 def test_cached_download_does_not_call_kaggle_again(tmp_path: Path) -> None:
     """Catches needless network calls that break resumability."""
     spec = next(x for x in source_registry() if x.license_status == "allowed")

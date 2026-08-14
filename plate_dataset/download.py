@@ -3,6 +3,7 @@ import hashlib
 import os
 from pathlib import Path
 import subprocess
+import sys
 from typing import Callable, Literal
 
 import yaml
@@ -42,8 +43,11 @@ def download_source(
         archive, digest = cached
         return DownloadResult(spec.slug, "cached", archive, "checksum_match", digest)
 
+    kaggle_executable = Path(sys.executable).with_name(
+        "kaggle.exe" if os.name == "nt" else "kaggle"
+    )
     command = [
-        "kaggle",
+        str(kaggle_executable),
         "datasets",
         "download",
         "-d",

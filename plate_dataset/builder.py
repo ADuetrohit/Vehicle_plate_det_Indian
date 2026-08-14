@@ -277,10 +277,13 @@ def _matches_synthetic_spec(row: Mapping[str, str] | None, spec: GenerationSpec)
             and not row.get("state")
             and not row.get("plate_text")
             and not row.get("ocr_path")
+            and row.get("ocr_eligible") == "false"
             and not row.get("ocr_sha256")
         )
     return (
-        row.get("plate_style") == spec.category
+        bool(row.get("plate_text"))
+        and row.get("ocr_path") == f"ocr/images/{spec.split}/{spec.output_id}.jpg"
+        and row.get("plate_style") == spec.category
         and row.get("plate_layout") == spec.layout
         and (row.get("state") == "MH") == spec.force_mh
     )

@@ -324,3 +324,29 @@ def test_synthetic_only_resume_rebuilds_checksum_valid_stale_spec_metadata(tmp_p
         assert sum(
             row["negative"] == "true" for row in final_rows.values() if row["split"] == split
         ) == quota.negatives
+
+def test_synthetic_only_resume_rebuilds_stale_crop_text_and_negative_ocr_metadata(tmp_path: Path) -> None:
+    """Catches reuse accepting borrowed crops, empty positive text, or OCR-eligible negatives."""
+    config = _synthetic_only_config(tmp_path / "dataset")
+    records = _write_real_records(tmp_path, 8)
+    first = build_dataset(config, records, config.workspace)
+    rows = _manifest_rows(first.manifest_path)
+    positives = [row for row in rows if row["negative"] == "false"]
+    borrowed_crop, empty_text = positives[:2]
+    donor = positives[2]
+    stale_negative = next(row for row in rows if row["negative"] == "true")
+    borrowed_crop["ocr_path"] = donor["ocr_path"]
+    borrowed_crop["ocr_sha256"] = donor["ocr_sha256"]
+    empty_text["plate_text"] = ""
+    stale_negative["ocr_eligible"] = "true"
+    write_manifest(rows, first.manifest_path)
+
+    resumed = build_dataset(config, records, config.workspace)
+    final_rows = {row["output_id"]: row for row in _manifest_rows(resumed.manifest_path)}
+
+    assert resumed.reused_count == 17
+    assert final_rows[borrowed_crop["output_id"]]["ocr_path"] == (
+        f"ocr/images/{borrowed_crop['split']}/{borrowed_crop['output_id']}.jpg"
+    )
+    assert final_rows[empty_text["output_id"]]["plate_text"]
+    assert final_rows[stale_negative["output_id"]]["ocr_eligible"] == "false"

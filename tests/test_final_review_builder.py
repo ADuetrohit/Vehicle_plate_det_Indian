@@ -360,3 +360,33 @@ def test_manifest_detector_eligibility_matches_emitted_labels(
         else:
             assert row["detector_eligible"] == "true"
             assert len(label_text.splitlines()) == 1
+
+
+def test_synthetic_specs_exclude_anchors_that_perspective_can_shrink_below_training_minimum(
+    tmp_path: Path,
+) -> None:
+    """Catches a barely valid source anchor crashing a later synthetic render."""
+    workspace = tmp_path / "dataset"
+    config = replace(_config(workspace, target=50), max_scene_edge=960)
+    records = _write_records(tmp_path, count=3)
+    skinny_path = tmp_path / "source" / "skinny.jpg"
+    Image.new("RGB", (960, 540), (50, 70, 90)).save(skinny_path, quality=95)
+    records.append(
+        ImageRecord(
+            record_id="skinny-record",
+            image_path=skinny_path,
+            width=960,
+            height=540,
+            boxes=(Box(0, 910, 390.5, 943.5, 399),),
+            source_id="fixture/skinny",
+            source_family="skinny-family",
+            is_real=True,
+            plate_text=None,
+            tags={"vehicle_type": "car", "viewpoint": "rear"},
+        )
+    )
+
+    specs = builder._synthetic_specs(config, records, frozenset())
+
+    assert len(specs) == config.target_images
+    assert all(spec.source.record_id != "skinny-record" for spec in specs)

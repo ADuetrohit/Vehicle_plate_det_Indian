@@ -49,6 +49,8 @@ _EFFECTS = ("day", "night", "rain", "fog", "glare", "shadow", "motion", "compres
 _CHECKPOINT_INTERVAL = 100
 _GENERATION_PROFILE_VERSION = "synthetic-v2"
 _REJECTION_TOMBSTONE_VERSION = 1
+_MIN_COMPOSITE_WIDTH_RATIO = 0.89
+_MIN_COMPOSITE_HEIGHT_RATIO = 0.71
 
 
 def _stable_hex(*values: object) -> str:
@@ -304,6 +306,15 @@ def _synthetic_specs(
     forbidden_plate_texts: AbstractSet[str] = frozenset(),
     tombstones: Mapping[str, Sequence[Mapping[str, object]]] | None = None,
 ) -> list[GenerationSpec]:
+    records = [
+        record
+        for record in records
+        if _source_can_render_detector_eligible_plate(record, config)
+    ]
+    if not records:
+        raise InsufficientSourceData(
+            "no source scene contains a plate anchor large enough for detector training"
+        )
     generation_profile = _generation_profile_sha256(
         config, records, forbidden_plate_texts
     )
@@ -419,12 +430,12 @@ def _persist_rejected_candidates(
 
 
 def _load_scaled_anchor(
-    source: ImageRecord, max_scene_edge: int
+    source: ImageRecord, config: BuildConfig
 ) -> tuple[np.ndarray, Box, tuple[Box, ...]]:
     with Image.open(source.image_path) as image:
         image = image.convert("RGB")
         width, height = image.size
-        scale = min(1.0, max_scene_edge / max(width, height))
+        scale = min(1.0, config.max_scene_edge / max(width, height))
         resized_size = (max(1, round(width * scale)), max(1, round(height * scale)))
         if resized_size != image.size:
             image = image.resize(resized_size, Image.Resampling.LANCZOS)
@@ -440,15 +451,53 @@ def _load_scaled_anchor(
             box.y_max * scale,
         ).clip(scene.shape[1], scene.shape[0])
         anchors.append(scaled)
-        if scaled.x_max - scaled.x_min >= 8 and scaled.y_max - scaled.y_min >= 4:
+        if _composite_box_meets_training_minimum(
+            scaled, scene.shape[1], scene.shape[0], config
+        ):
             candidates.append(scaled)
     if not candidates:
-        raise InsufficientSourceData(f"source scene {source.record_id} has no valid plate anchor")
+        raise InsufficientSourceData(
+            f"source scene {source.record_id} has no detector-eligible plate anchor"
+        )
     primary = max(
         candidates,
         key=lambda box: (box.x_max - box.x_min) * (box.y_max - box.y_min),
     )
     return scene, primary, tuple(anchors)
+
+
+def _source_can_render_detector_eligible_plate(
+    source: ImageRecord, config: BuildConfig
+) -> bool:
+    if source.width <= 0 or source.height <= 0:
+        return False
+    scale = min(1.0, config.max_scene_edge / max(source.width, source.height))
+    width = max(1, round(source.width * scale))
+    height = max(1, round(source.height * scale))
+    for box in source.boxes:
+        scaled = Box(
+            box.class_id,
+            box.x_min * scale,
+            box.y_min * scale,
+            box.x_max * scale,
+            box.y_max * scale,
+        ).clip(width, height)
+        if _composite_box_meets_training_minimum(scaled, width, height, config):
+            return True
+    return False
+
+
+def _composite_box_meets_training_minimum(
+    box: Box, image_width: int, image_height: int, config: BuildConfig
+) -> bool:
+    scale = config.training_imgsz / max(image_width, image_height)
+    minimum_width, minimum_height = config.min_box_at_training_size
+    return (
+        (box.x_max - box.x_min) * _MIN_COMPOSITE_WIDTH_RATIO * scale
+        >= minimum_width
+        and (box.y_max - box.y_min) * _MIN_COMPOSITE_HEIGHT_RATIO * scale
+        >= minimum_height
+    )
 
 
 def _matches_synthetic_spec(row: Mapping[str, str] | None, spec: GenerationSpec) -> bool:
@@ -584,9 +633,7 @@ def _render_synthetic_spec(
     ):
         return GenerationResult(dict(old_row), True)
 
-    scene, anchor, source_anchors = _load_scaled_anchor(
-        spec.source, config.max_scene_edge
-    )
+    scene, anchor, source_anchors = _load_scaled_anchor(spec.source, config)
     generator = _rng(config.seed, spec.split, spec.source.source_family, spec.variant_index)
     for source_anchor in source_anchors:
         scene = erase_plate(scene, source_anchor, generator)

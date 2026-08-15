@@ -2,6 +2,30 @@
 
 This project builds a reproducible one-class YOLO detection dataset (`number_plate`, class `0`) and a paired OCR crop collection. It creates the dataset only; detector training, model export, and real-camera benchmarking remain separate tasks.
 
+## Completed build: 15 August 2026
+
+The requested dataset has been generated in this exact folder and fully validated.
+
+| Item | Completed count / result |
+| --- | --- |
+| Detector images | 50,000 |
+| YOLO label files | 50,000 |
+| Training pairs | 40,000 |
+| Validation pairs | 5,000 |
+| Test pairs | 5,000 |
+| Positive plate scenes | 46,250 |
+| Empty-label hard negatives | 3,750 |
+| New synthetic OCR crops | 46,250 |
+| Preserved original OCR crops | 2,122 |
+| OCR label rows in total | 48,372 |
+| Normalized licensed source records | 2,181 |
+| Detector/OCR artifact footprint | about 1.72 GiB |
+| Full validation | 50,000 images + 50,000 labels, 0 errors |
+
+The validator emits two non-blocking provenance warnings because the approved source packages do not supply verified vehicle type or viewpoint metadata. Those fields remain `unknown` instead of being guessed; this does not affect YOLO labels, detector training, OCR crops, or OCR labels.
+
+See [README/DATASET_INVENTORY.md](README/DATASET_INVENTORY.md) for a complete folder inventory, exact distribution counts, validation details, and the Colab handoff checklist.
+
 ## Fixed output profile
 
 - Seed: `20260814`.

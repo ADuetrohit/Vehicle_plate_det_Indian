@@ -390,3 +390,29 @@ def test_synthetic_specs_exclude_anchors_that_perspective_can_shrink_below_train
 
     assert len(specs) == config.target_images
     assert all(spec.source.record_id != "skinny-record" for spec in specs)
+
+
+def test_synthetic_only_resume_removes_stale_generated_artifacts(
+    tmp_path: Path,
+) -> None:
+    """Catches an interrupted or profile-changed build leaving extra synthetic files."""
+    workspace = tmp_path / "dataset"
+    config = _config(workspace)
+    records = _write_records(tmp_path)
+    build_dataset(config, records, workspace)
+    stale_id = "syn-aaaaaaaaaaaaaaaaaaaa"
+    stale_paths = (
+        workspace / "detection" / "images" / "train" / f"{stale_id}.jpg",
+        workspace / "detection" / "labels" / "train" / f"{stale_id}.txt",
+        workspace / "ocr" / "images" / "train" / f"{stale_id}.jpg",
+    )
+    for path in stale_paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"stale")
+    preserved_crop = workspace / "ocr" / "images" / "train" / "syn-reference.jpg"
+    preserved_crop.write_bytes(b"preserved")
+
+    build_dataset(config, records, workspace)
+
+    assert all(not path.exists() for path in stale_paths)
+    assert preserved_crop.read_bytes() == b"preserved"

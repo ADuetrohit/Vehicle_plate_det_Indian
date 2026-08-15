@@ -787,6 +787,43 @@ def _render_failure(job: GenerationJob, error: Exception) -> RuntimeError:
     )
 
 
+def _is_generated_synthetic_artifact(path: Path) -> bool:
+    stem = path.stem
+    return (
+        len(stem) == 24
+        and stem.startswith("syn-")
+        and all(character in "0123456789abcdef" for character in stem[4:])
+    )
+
+
+def _remove_stale_synthetic_artifacts(
+    output: Path, rows: Sequence[Mapping[str, object]]
+) -> None:
+    expected: set[Path] = set()
+    for row in rows:
+        output_id = str(row["output_id"])
+        split = str(row["split"])
+        image_path, label_path = _paths(output, split, output_id)
+        expected.update({image_path, label_path})
+        if str(row.get("negative", "")).lower() != "true":
+            expected.add(output / "ocr" / "images" / split / f"{output_id}.jpg")
+
+    for root in (
+        output / "detection" / "images",
+        output / "detection" / "labels",
+        output / "ocr" / "images",
+    ):
+        if not root.is_dir():
+            continue
+        for candidate in sorted(root.rglob("syn-*")):
+            if (
+                candidate.is_file()
+                and _is_generated_synthetic_artifact(candidate)
+                and candidate not in expected
+            ):
+                candidate.unlink()
+
+
 def _build_synthetic_only(
     config: BuildConfig,
     records: Sequence[ImageRecord],
@@ -900,6 +937,7 @@ def _build_synthetic_only(
 
     if len(rows) != config.target_images:
         raise RuntimeError(f"builder emitted {len(rows)} records, expected {config.target_images}")
+    _remove_stale_synthetic_artifacts(output, rows)
     write_manifest(rows, manifest_path)
     return BuildManifest(
         seed=config.seed,

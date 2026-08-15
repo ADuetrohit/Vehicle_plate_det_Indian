@@ -113,4 +113,6 @@ The 50,000-image detector package can be large, so Google Drive transfer is more
 
 Final deployment thresholds and OCR acceptance rules require footage from the actual Raspberry Pi 3B+ and Camera Module 3 installation. Evaluate at the installed pole height, angle, and distance with front and rear vehicles across daylight, night, rain, glare, occlusion, and motion. Keep the vehicle tracker as the first stage, run plate detection within tracked vehicle crops, rank candidate crops, and aggregate OCR over multiple frames. Synthetic holdout metrics cannot replace that evaluation.
 
-Generated bulk images, labels, raw downloads, OCR crops, and sensitive credentials are excluded from Git. Source code, configuration, documentation, license decisions, and compact validation statistics remain versioned.
+## GitHub dataset access
+
+The published repository stores the generated JPEG images and source archives with Git LFS, so the normal Git history stays manageable while the full dataset remains available after cloning. Install Git LFS before cloning, then run `git lfs pull` if the images were not downloaded automatically. Source code, labels, metadata, reports, configuration, and documentation are versioned normally. Kaggle credentials, virtual environments, caches, and working trees are never included.

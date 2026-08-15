@@ -1,0 +1,92 @@
+{
+  "distributions": {
+    "effect": {
+      "compression": 3750,
+      "day": 3750,
+      "distance": 3750,
+      "fog": 3750,
+      "glare": 3750,
+      "motion": 3750,
+      "night": 12500,
+      "occlusion": 3750,
+      "rain": 7500,
+      "shadow": 3750
+    },
+    "negative": {
+      "false": 46250,
+      "true": 3750
+    },
+    "origin": {
+      "synthetic": 50000
+    },
+    "plate_layout": {
+      "double": 9250,
+      "none": 3750,
+      "single": 37000
+    },
+    "plate_style": {
+      "commercial": 9299,
+      "electric_commercial": 9235,
+      "electric_private": 9246,
+      "private": 9254,
+      "removed": 3750,
+      "temporary": 9216
+    },
+    "split": {
+      "test": 5000,
+      "train": 40000,
+      "val": 5000
+    },
+    "state": {
+      "AP": 888,
+      "BR": 918,
+      "CG": 918,
+      "DL": 878,
+      "GA": 925,
+      "GJ": 929,
+      "HR": 884,
+      "KA": 888,
+      "KL": 896,
+      "MH": 30063,
+      "MP": 874,
+      "OD": 951,
+      "PB": 903,
+      "RJ": 913,
+      "TN": 892,
+      "TS": 900,
+      "UK": 884,
+      "UP": 848,
+      "WB": 898,
+      "unknown": 3750
+    },
+    "vehicle_type": {
+      "unknown": 50000
+    },
+    "viewpoint": {
+      "unknown": 50000
+    }
+  },
+  "error_count": 0,
+  "image_count": 50000,
+  "issues": [
+    {
+      "code": "unknown_category",
+      "message": "vehicle_type has unknown values",
+      "path": "D:\\obj_det_dataset\\synthetic_number_plate_dataset\\metadata\\generation_manifest.csv",
+      "severity": "warning"
+    },
+    {
+      "code": "unknown_category",
+      "message": "viewpoint has unknown values",
+      "path": "D:\\obj_det_dataset\\synthetic_number_plate_dataset\\metadata\\generation_manifest.csv",
+      "severity": "warning"
+    }
+  ],
+  "label_count": 50000,
+  "split_counts": {
+    "test": 5000,
+    "train": 40000,
+    "val": 5000
+  },
+  "warning_count": 2
+}

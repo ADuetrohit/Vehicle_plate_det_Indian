@@ -1,0 +1,5 @@
+source_id,status,archive_path,reason,sha256
+kedarsai/indian-license-plates-with-labels,downloaded,raw/kedarsai__indian-license-plates-with-labels/indian-license-plates-with-labels.zip,ok,259a4ecf7a95818270283446787150868a3e5fbb2697384f30da0e521a7a1499
+deepakat002/indian-vehicle-number-plate-yolo-annotation,downloaded,raw/deepakat002__indian-vehicle-number-plate-yolo-annotation/indian-vehicle-number-plate-yolo-annotation.zip,ok,285a03bb6b44078c64786705f92dc6b4883ea3479800b24e742fd71636d39c17
+saisirishan/indian-vehicle-dataset,skipped,,license_not_allowed,
+gauravsanwal/indian-licence-plate,skipped,,license_not_allowed,

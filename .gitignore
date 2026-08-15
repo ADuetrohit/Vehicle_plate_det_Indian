@@ -1,20 +1,27 @@
+# Environments and caches
 .venv/
+ocr_training/.venv/
 .worktrees/
 __pycache__/
 .pytest_cache/
 *.pyc
 *.egg-info/
+
+# Credentials never enter the repository
+kaggle.json
+
+# Image payloads and archives are distributed outside git.
+# ~98,000 JPEGs across detection/ and ocr/ total roughly 1.8 GiB. Git LFS is a
+# poor fit: every object costs its own HTTPS round-trip, so a push of this many
+# small files stalls, and the volume exceeds the free LFS storage allowance.
+# Everything needed to regenerate them deterministically (seed 20260814) is
+# committed: source code, configuration, labels, and the full manifests.
 raw/
 detection/images/
-detection/labels/
 ocr/images/
-ocr/labels.csv
-metadata/source_manifest.csv
-metadata/rejected_source_records.csv
-metadata/generation_manifest.csv
-metadata/rejected_generation_slots.json
-metadata/normalized_records.jsonl
 reports/contact_sheets/
-kaggle.json
 *.zip
 *.rar
+
+# Training outputs
+ocr_training/checkpoints/

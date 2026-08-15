@@ -1,0 +1,22 @@
+{
+  "train": 41620,
+  "val": 4630,
+  "test": 2090,
+  "rejected": 32,
+  "test_is_real_only": true,
+  "test_unique_registrations": 1668,
+  "label_repair": {
+    "exact": 2018,
+    "repaired": 72,
+    "rejected": 32,
+    "repaired_by_consensus": 2
+  },
+  "train_layout": {
+    "double": 8319,
+    "single": 33301
+  },
+  "val_layout": {
+    "single": 3699,
+    "double": 931
+  }
+}
